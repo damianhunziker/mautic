@@ -1,0 +1,233 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Mautic\DynamicContentBundle\Tests\Controller;
+
+use Mautic\CoreBundle\Test\MauticMysqlTestCase;
+use Mautic\DynamicContentBundle\Entity\DynamicContent;
+use Mautic\ProjectBundle\Entity\Project;
+use Mautic\UserBundle\Entity\Permission;
+use Mautic\UserBundle\Entity\Role;
+use Mautic\UserBundle\Entity\User;
+use PHPUnit\Framework\Assert;
+use Symfony\Component\DomCrawler\Crawler;
+use Symfony\Component\HttpFoundation\Request;
+use Symfony\Component\HttpFoundation\Response;
+use Symfony\Component\PasswordHasher\PasswordHasherInterface;
+
+class DynamicContentControllerFunctionalTest extends MauticMysqlTestCase
+{
+    public const PERMISSION_CREATE       = 'dynamiccontent:dynamiccontents:create';
+    public const PERMISSION_DELETE_OTHER = 'dynamiccontent:dynamiccontents:deleteother';
+    public const PERMISSION_DELETE_OWN   = 'dynamiccontent:dynamiccontents:deleteown';
+
+    public const BITWISE_BY_PERM = [
+        self::PERMISSION_CREATE       => 52,
+        self::PERMISSION_DELETE_OWN   => 66,
+        self::PERMISSION_DELETE_OTHER => 150,
+    ];
+    private const NO_NESTING_VALIDATION_MESSAGE = 'DWC tokens cannot be used within another DWC. Please remove any DWC tokens from the content to proceed.';
+
+    public function testAccessControlNewAction(): void
+    {
+        $this->createAndLoginUser(self::PERMISSION_CREATE);
+        $this->client->request(Request::METHOD_GET, '/s/dwc/new');
+
+        self::assertResponseIsSuccessful();
+    }
+
+    public function testNoNestingValidationNewAction(): void
+    {
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/dwc/new');
+        self::assertResponseIsSuccessful();
+
+        $this->submitFormAndAssertNoNestingValidation($crawler);
+    }
+
+    public function testForbiddenNewAction(): void
+    {
+        $this->createAndLoginUser();
+        $this->client->request(Request::METHOD_GET, '/s/dwc/new');
+
+        self::assertResponseStatusCodeSame(Response::HTTP_FORBIDDEN);
+    }
+
+    public function testNoNestingValidationEditAction(): void
+    {
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/dwc/new');
+        self::assertResponseIsSuccessful();
+
+        $buttonCrawler = $crawler->selectButton('Save');
+        $form          = $buttonCrawler->form();
+        $form->setValues([
+            'dwc[name]'    => 'Some name',
+            'dwc[content]' => 'Some content',
+        ]);
+        $crawler = $this->client->submit($form);
+
+        self::assertResponseIsSuccessful();
+        Assert::assertStringNotContainsString(self::NO_NESTING_VALIDATION_MESSAGE, $crawler->text());
+        Assert::assertStringContainsString('Edit Dynamic Content', $crawler->text());
+
+        $this->submitFormAndAssertNoNestingValidation($crawler);
+    }
+
+    public function testAccessDeleteAction(): void
+    {
+        $this->createAndLoginUser(self::PERMISSION_DELETE_OWN);
+        $this->client->request(Request::METHOD_POST, '/s/dwc/delete');
+
+        self::assertResponseIsSuccessful($this->client->getResponse()->getContent());
+    }
+
+    public function testForbiddenDeleteAction(): void
+    {
+        $this->createAndLoginUser();
+        $this->client->request('GET', '/s/dwc/delete');
+
+        self::assertResponseStatusCodeSame(Response::HTTP_FORBIDDEN);
+    }
+
+    public function testDwcWithProject(): void
+    {
+        $dynamicContent = new DynamicContent();
+        $dynamicContent->setName('test');
+        $this->em->persist($dynamicContent);
+
+        $project = new Project();
+        $project->setName('Test Project');
+        $this->em->persist($project);
+
+        $this->em->flush();
+        $this->em->clear();
+
+        $crawler = $this->client->request('GET', '/s/dwc/edit/'.$dynamicContent->getId());
+        $form    = $crawler->selectButton('Save')->form();
+        $form['dwc[projects]']->setValue((string) $project->getId());
+
+        $this->client->submit($form);
+
+        $this->assertResponseIsSuccessful();
+
+        $savedAsset = $this->em->find(DynamicContent::class, $dynamicContent->getId());
+        Assert::assertSame($project->getId(), $savedAsset->getProjects()->first()->getId());
+    }
+
+    private function createAndLoginUser(?string $permission = null): User
+    {
+        // Create non-admin role
+        $role = $this->createRole();
+        // Create permissions to update user for the role
+        if (!empty($permission)) {
+            $this->createPermission($permission, $role, self::BITWISE_BY_PERM[$permission]);
+        }
+        // Create non-admin user
+        $user = $this->createUser($role);
+
+        $this->em->flush();
+        $this->em->detach($role);
+
+        $this->loginUser($user);
+        $this->client->setServerParameter('PHP_AUTH_USER', $user->getUserIdentifier());
+        $this->client->setServerParameter('PHP_AUTH_PW', 'Maut1cR0cks!');
+
+        return $user;
+    }
+
+    private function createRole(bool $isAdmin = false): Role
+    {
+        $role = new Role();
+        $role->setName('Role');
+        $role->setIsAdmin($isAdmin);
+
+        $this->em->persist($role);
+
+        return $role;
+    }
+
+    private function createPermission(string $rawPermission, Role $role, int $bitwise): void
+    {
+        $parts      = explode(':', $rawPermission);
+        $permission = new Permission();
+        $permission->setBundle($parts[0]);
+        $permission->setName($parts[1]);
+        $permission->setRole($role);
+        $permission->setBitwise($bitwise);
+
+        $this->em->persist($permission);
+    }
+
+    private function createUser(Role $role): User
+    {
+        $user = new User();
+        $user->setFirstName('John');
+        $user->setLastName('Doe');
+        $user->setUsername('john.doe');
+        $user->setEmail('john.doe@email.com');
+        $hasher = self::getContainer()->get('security.password_hasher_factory')->getPasswordHasher($user);
+        \assert($hasher instanceof PasswordHasherInterface);
+        $user->setPassword($hasher->hash('Maut1cR0cks!'));
+        $user->setRole($role);
+
+        $this->em->persist($user);
+
+        return $user;
+    }
+
+    public function testIndexActionIsSuccessful(): void
+    {
+        $this->client->request(Request::METHOD_GET, '/s/dwc');
+        $response = $this->client->getResponse();
+
+        $this->assertEquals(Response::HTTP_OK, $response->getStatusCode());
+    }
+
+    public function testNewActionIsSuccessful(): void
+    {
+        $this->client->request(Request::METHOD_GET, '/s/dwc/new');
+        $response = $this->client->getResponse();
+
+        $this->assertEquals(Response::HTTP_OK, $response->getStatusCode());
+    }
+
+    public function testEditActionIsSuccessful(): void
+    {
+        $entity = new DynamicContent();
+        $entity->setName('Test Dynamic Content');
+        $this->em->persist($entity);
+        $this->em->flush();
+
+        $this->client->request(Request::METHOD_GET, '/s/dwc/edit/'.$entity->getId());
+        $response = $this->client->getResponse();
+
+        $this->assertEquals(Response::HTTP_OK, $response->getStatusCode());
+    }
+
+    public function testViewActionIsSuccessful(): void
+    {
+        $entity = new DynamicContent();
+        $entity->setName('Test Dynamic Content');
+        $this->em->persist($entity);
+        $this->em->flush();
+
+        $this->client->request(Request::METHOD_GET, '/s/dwc/view/'.$entity->getId());
+        $response = $this->client->getResponse();
+
+        $this->assertEquals(Response::HTTP_OK, $response->getStatusCode());
+    }
+
+    private function submitFormAndAssertNoNestingValidation(Crawler $crawler): void
+    {
+        $buttonCrawler = $crawler->selectButton('Save');
+        $form          = $buttonCrawler->form();
+        $form->setValues([
+            'dwc[name]'    => 'Some name',
+            'dwc[content]' => 'Some {dwc=slotname}',
+        ]);
+        $crawler = $this->client->submit($form);
+
+        self::assertResponseIsSuccessful();
+        Assert::assertStringContainsString(self::NO_NESTING_VALIDATION_MESSAGE, $crawler->text());
+    }
+}

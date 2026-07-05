@@ -1,0 +1,1486 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Mautic\EmailBundle\Tests\Controller;
+
+use Doctrine\ORM\OptimisticLockException;
+use Doctrine\ORM\ORMException;
+use Doctrine\ORM\TransactionRequiredException;
+use Mautic\CoreBundle\Test\MauticMysqlTestCase;
+use Mautic\CoreBundle\Tests\Traits\ControllerTrait;
+use Mautic\DynamicContentBundle\DynamicContent\TypeList;
+use Mautic\DynamicContentBundle\Entity\DynamicContent;
+use Mautic\EmailBundle\Entity\Email;
+use Mautic\EmailBundle\Entity\Stat;
+use Mautic\EmailBundle\Mailer\Message\MauticMessage;
+use Mautic\EmailBundle\Tests\Functional\Fixtures\EmailFixturesHelper;
+use Mautic\LeadBundle\Entity\Lead;
+use Mautic\LeadBundle\Entity\LeadList;
+use Mautic\LeadBundle\Entity\ListLead;
+use Mautic\ProjectBundle\Entity\Project;
+use Mautic\UserBundle\Entity\Role;
+use Mautic\UserBundle\Entity\User;
+use PHPUnit\Framework\Assert;
+use PHPUnit\Framework\Attributes\DataProvider;
+use Symfony\Bridge\Doctrine\DataCollector\DoctrineDataCollector;
+
+use function Symfony\Component\Clock\now;
+
+use Symfony\Component\DomCrawler\Crawler;
+use Symfony\Component\HttpFoundation\Request;
+
+final class EmailControllerFunctionalTest extends MauticMysqlTestCase
+{
+    use ControllerTrait;
+
+    private const CLICK_URL_LOW  = 'https://example.com/low';
+    private const CLICK_URL_MID  = 'https://example.com/mid';
+    private const CLICK_URL_HIGH = 'https://example.com/high';
+
+    public function setUp(): void
+    {
+        $this->configParams['legacy_builder_enabled'] = true;
+        $this->configParams['disable_trackable_urls'] = false;
+        $this->configParams['mailer_from_name']       = 'Mautic Admin';
+        $this->configParams['mailer_from_email']      = 'admin@email.com';
+        $this->configParams['mailer_custom_headers']  = ['x-global-custom-header' => 'value123'];
+        $this->clientOptions                          = ['debug' => true];
+
+        parent::setUp();
+    }
+
+    /**
+     * Check if email contains correct values.
+     */
+    public function testViewEmail(): void
+    {
+        $email = $this->createEmail('ABC', 'template', 'list', 'blank', 'Test html');
+        $email->setDateAdded(new \DateTime('2020-02-07 20:29:02'));
+        $email->setDateModified(new \DateTime('2020-03-21 20:29:02'));
+        $email->setCreatedByUser('Test User');
+
+        $this->em->persist($email);
+        $this->em->flush();
+        $this->em->detach($email);
+
+        $this->client->request('GET', '/s/emails');
+        $clientResponse = $this->client->getResponse();
+        $this->assertResponseIsSuccessful('Return code must be 200');
+        $this->assertStringContainsString('February 7, 2020', $clientResponse->getContent());
+        $this->assertStringContainsString('March 21, 2020', $clientResponse->getContent());
+        $this->assertStringContainsString('Test User', $clientResponse->getContent());
+
+        $urlAlias   = 'emails';
+        $routeAlias = 'email';
+        $column     = 'dateModified';
+        $column2    = 'name';
+        $tableAlias = 'e.';
+
+        $this->getControllerColumnTests($urlAlias, $routeAlias, $column, $tableAlias, $column2);
+    }
+
+    /**
+     * Filtering should return status code 200.
+     */
+    public function testIndexActionWhenFiltering(): void
+    {
+        $this->client->request('GET', '/s/emails?search=has%3Aresults&tmpl=list');
+        $this->assertResponseIsSuccessful();
+    }
+
+    /**
+     * Ensure there is no query for DNC reasons if there are no contacts who received the email
+     * because it loads the whole DNC table if no contact IDs are provided. It can lead to
+     * memory limit error if the DNC table is big.
+     *
+     * @throws ORMException
+     * @throws OptimisticLockException
+     */
+    public function testProfileEmailDetailPageForUnsentEmail(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+        $email   = $this->createEmail('Email A', 'Email A Subject', 'list', 'blank', 'Test html', $segment);
+        $this->em->flush();
+
+        $this->client->enableProfiler();
+        $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}");
+
+        $profile = $this->client->getProfile();
+
+        /** @var DoctrineDataCollector $dbCollector */
+        $dbCollector = $profile->getCollector('db');
+        $queries     = $dbCollector->getQueries();
+        $prefix      = static::getContainer()->getParameter('mautic.db_table_prefix');
+
+        $dncQueries = array_filter(
+            $queries['default'],
+            fn (array $query) => "SELECT l.id, dnc.reason FROM {$prefix}lead_donotcontact dnc LEFT JOIN {$prefix}leads l ON l.id = dnc.lead_id WHERE dnc.channel = :channel" === $query['sql']
+        );
+
+        Assert::assertCount(0, $dncQueries);
+    }
+
+    /**
+     * On the other hand there should be the query for DNC reasons if there are contacts who received the email.
+     *
+     * @throws ORMException
+     * @throws OptimisticLockException
+     */
+    public function testProfileEmailDetailPageForSentEmail(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+        $email   = $this->createEmail('Email A', 'Email A Subject', 'list', 'blank', 'Test html', $segment);
+
+        $contact = new Lead();
+        $contact->setEmail('john@doe.email');
+        $emailStat = new Stat();
+        $emailStat->setEmail($email);
+        $emailStat->setLead($contact);
+        $emailStat->setEmailAddress($contact->getEmail());
+        $emailStat->setDateSent(new \DateTime());
+        $this->em->persist($contact);
+        $this->em->persist($emailStat);
+        $this->em->flush();
+
+        $this->client->enableProfiler();
+        $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}");
+
+        $profile = $this->client->getProfile();
+
+        /** @var DoctrineDataCollector $dbCollector */
+        $dbCollector = $profile->getCollector('db');
+        $queries     = $dbCollector->getQueries();
+        $prefix      = static::getContainer()->getParameter('mautic.db_table_prefix');
+
+        $dncQueries = array_filter(
+            $queries['default'],
+            fn (array $query) => "SELECT l.id, dnc.reason FROM {$prefix}lead_donotcontact dnc LEFT JOIN {$prefix}leads l ON l.id = dnc.lead_id WHERE (dnc.channel = ?) AND (l.id IN ({$contact->getId()}))" === $query['sql']
+        );
+
+        Assert::assertCount(1, $dncQueries, 'DNC query not found. '.var_export(array_map(fn (array $query) => $query['sql'], $queries['default']), true));
+    }
+
+    public function testEmailDetailPageForDisabledSendButton(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+        $email   = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'test html', $segment);
+        $email->setPublishUp(new \DateTime('now -1 hour'));
+        $this->em->persist($email);
+        $this->em->flush();
+
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}");
+        $html    = $crawler->filterXPath('//*[@id="toolbar"]')->html();
+        $this->assertStringContainsString('Email is sending in the background', $html, $html);
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails');
+        $html    = $crawler->filter('.email-list > tbody > tr:nth-child(1) > td:nth-child(1)')->html();
+        $this->assertStringContainsString('Email is sending in the background', $html, $html);
+
+        $email->setPublishUp(new \DateTime('now +1 hour'));
+        $this->em->persist($email);
+        $this->em->flush();
+
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}");
+        $html    = $crawler->filterXPath('//*[@id="toolbar"]')->html();
+        $this->assertStringNotContainsString('Email is sending in the background', $html, $html);
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails');
+        $html    = $crawler->filter('.email-list > tbody > tr:nth-child(1) > td:nth-child(1)')->html();
+        $this->assertStringNotContainsString('Email is sending in the background', $html, $html);
+
+        $email->setPublishUp(null);
+        $this->em->persist($email);
+        $this->em->flush();
+
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}");
+        $html    = $crawler->filterXPath('//*[@id="toolbar"]')->html();
+        $this->assertStringNotContainsString('disabled', $html, $html);
+    }
+
+    public function testEmailDetailClickCountsCanBeSortedByClicks(): void
+    {
+        $email = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'test html');
+        $this->em->flush();
+
+        $fixtures = new EmailFixturesHelper($this->em);
+        $fixtures->createEmailLink(self::CLICK_URL_LOW, $email->getId(), 1, 1);
+        $fixtures->createEmailLink(self::CLICK_URL_HIGH, $email->getId(), 5, 1);
+        $fixtures->createEmailLink(self::CLICK_URL_MID, $email->getId(), 3, 1);
+        $this->em->flush();
+
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}");
+        $this->assertResponseIsSuccessful();
+        Assert::assertGreaterThan(0, $crawler->filter('.click-list thead th[scope="col"]')->count());
+
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}?name=email.clicks&orderby=t.hits");
+        $this->assertResponseIsSuccessful();
+        Assert::assertSame(
+            [
+                self::CLICK_URL_HIGH,
+                self::CLICK_URL_MID,
+                self::CLICK_URL_LOW,
+            ],
+            $this->getClickCountUrls($crawler)
+        );
+
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}?tmpl=click_counts&name=email.clicks&orderby=t.hits");
+        $this->assertResponseIsSuccessful();
+        Assert::assertSame(
+            [
+                self::CLICK_URL_LOW,
+                self::CLICK_URL_MID,
+                self::CLICK_URL_HIGH,
+            ],
+            $this->getClickCountUrls($crawler)
+        );
+    }
+
+    /**
+     * @throws ORMException
+     * @throws OptimisticLockException
+     */
+    public function testSegmentEmailTranslationLookUp(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+        $email   = $this->createEmail('Email A', 'Email A Subject', 'list', 'blank', 'Test html', $segment);
+        $this->em->flush();
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $html    = $crawler->filterXPath("//select[@id='emailform_segmentTranslationParent']//optgroup")->html();
+        self::assertSame('<option value="'.$email->getId().'">'.$email->getName().' ('.$email->getId().')</option>', trim($html));
+    }
+
+    public function testSegmentEmailVariationChildrenParents(): void
+    {
+        $segment         = $this->createSegment('Segment A', 'segment-a');
+        $emailGrandPah   = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'test html', $segment);
+        $this->em->persist($emailGrandPah);
+        $this->em->flush();
+
+        $emailParent = $this->createEmail('Email B', 'Subject B', 'list', 'blank', 'test html', $segment);
+        $emailParent->setVariantParent($emailGrandPah);
+        $this->em->persist($emailParent);
+        $emailGrandPah->addVariantChild($emailParent);
+        $this->em->flush();
+
+        $emailChild = $this->createEmail('Email C', 'Subject C', 'list', 'blank', 'test html', $segment);
+        $emailChild->setVariantParent($emailParent);
+        $this->em->persist($emailChild);
+        $emailParent->addVariantChild($emailChild);
+        $this->em->persist($emailChild);
+        $this->em->flush();
+
+        $crawler   = $this->client->request(Request::METHOD_GET, '/s/emails');
+        $emailRows = $crawler->filter('.email-list > tbody > tr');
+
+        // Find rows by email name to avoid relying on table order
+        $emailARow = null;
+        $emailBRow = null;
+        $emailCRow = null;
+
+        foreach ($emailRows as $row) {
+            $rowCrawler = new Crawler($row);
+            $html       = $rowCrawler->html();
+
+            if (str_contains($html, 'Email A')) {
+                $emailARow = $html;
+            } elseif (str_contains($html, 'Email B')) {
+                $emailBRow = $html;
+            } elseif (str_contains($html, 'Email C')) {
+                $emailCRow = $html;
+            }
+        }
+
+        Assert::assertNotNull($emailARow, 'Could not find Email A row');
+        Assert::assertNotNull($emailBRow, 'Could not find Email B row');
+        Assert::assertNotNull($emailCRow, 'Could not find Email C row');
+
+        // Email C (child) - should have A/B variant icon only
+        Assert::assertStringContainsString('ri-a-b fs-14', $emailCRow);
+        Assert::assertStringContainsString('Is A/B variant', $emailCRow);
+
+        // Email B (parent) - should have both A/B variant icon AND organization chart icon
+        Assert::assertStringContainsString('ri-a-b fs-14', $emailBRow);
+        Assert::assertStringContainsString('Is A/B variant', $emailBRow);
+        Assert::assertStringContainsString('ri-organization-chart', $emailBRow);
+        Assert::assertStringContainsString('Has A/B tests', $emailBRow);
+
+        // Email A (grandparent) - should have organization chart icon only
+        Assert::assertStringContainsString('Has A/B tests', $emailARow);
+        Assert::assertStringContainsString('ri-organization-chart', $emailARow);
+    }
+
+    #[DataProvider('provideHtmlForEmailTracking')]
+    public function testSegmentEmailSend(string $htmlContent, bool $singleOrDoubleQuotes): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+        $email   = $this->createEmail('Email A', 'Subject A', 'list', 'blank', $htmlContent, $segment);
+
+        $this->addContactsToSegment($segment, ['contact@one.email', 'contact@two.email']);
+        $this->em->flush();
+
+        $this->sendBatchEmail($email);
+
+        $email = self::getMailerMessage();
+        \assert($email instanceof MauticMessage);
+
+        $quote = $singleOrDoubleQuotes ? '\'' : '"';
+        // The order of the recipients is not guaranteed, so we need to check both possibilities.
+        Assert::assertSame('Subject A', $email->getSubject());
+        Assert::assertMatchesRegularExpression('#Ahoy <i>contact@(one|two)\.email</i><a href='.$quote.'(?:\R|)https://localhost/r/[a-z0-9]+\?ct=[a-zA-Z0-9%]+(?:\R|)'.$quote.'>Mautic</a><img height="1" width="1" src="https://localhost/email/[a-z0-9]+\.gif\?ct=[^"]+" alt="" />#', $email->getHtmlBody());
+        Assert::assertMatchesRegularExpression('#Ahoy _contact@(one|two).email_#', $email->getTextBody()); // Are the underscores expected?
+        Assert::assertCount(1, $email->getFrom());
+        Assert::assertSame($this->configParams['mailer_from_name'], $email->getFrom()[0]->getName());
+        Assert::assertSame($this->configParams['mailer_from_email'], $email->getFrom()[0]->getAddress());
+        Assert::assertCount(1, $email->getTo());
+        Assert::assertSame('', $email->getTo()[0]->getName());
+        Assert::assertMatchesRegularExpression('#contact@(one|two).email#', $email->getTo()[0]->getAddress());
+        Assert::assertCount(1, $email->getReplyTo());
+        Assert::assertSame('', $email->getReplyTo()[0]->getName());
+        Assert::assertSame($this->configParams['mailer_from_email'], $email->getReplyTo()[0]->getAddress());
+        Assert::assertSame('value123', $email->getHeaders()->get('x-global-custom-header')->getBody());
+    }
+
+    public function testSegmentEmailTranslationChildrenParents(): void
+    {
+        $segment         = $this->createSegment('Segment A', 'segment-a');
+        $emailGrandPah   = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'test html', $segment);
+        $this->em->persist($emailGrandPah);
+        $this->em->flush();
+
+        $emailParent = $this->createEmail('Email B', 'Subject B', 'list', 'blank', 'test html', $segment);
+        $emailParent->setTranslationParent($emailGrandPah);
+        $this->em->persist($emailParent);
+        $emailGrandPah->addTranslationChild($emailParent);
+        $this->em->flush();
+
+        $emailChild = $this->createEmail('Email C', 'Subject C', 'list', 'blank', 'test html', $segment);
+        $emailChild->setTranslationParent($emailParent);
+        $this->em->persist($emailChild);
+        $emailParent->addTranslationChild($emailChild);
+        $this->em->persist($emailChild);
+        $this->em->flush();
+
+        $crawler      = $this->client->request(Request::METHOD_GET, '/s/emails');
+        $iconNodes1   = $crawler->filter('.email-list .ri-translate.fs-14');
+        Assert::assertGreaterThanOrEqual(2, $iconNodes1->count(), 'Translate icon not found in the email list rows.');
+
+        $iconNodes2 = $crawler->filter('.email-list .ri-translate-2');
+        Assert::assertGreaterThanOrEqual(1, $iconNodes2->count(), 'Translate icon not found in the email list rows.');
+    }
+
+    public static function provideHtmlForEmailTracking(): \Generator
+    {
+        $variantQuotes   = ['single quote' => "'", 'double quote' => '"'];
+        $variantSpaces   = ['no space' => '$', 'start space' => ' $', 'end space' => '$ ', 'both spaces' => ' $ '];
+        $variantNewlines = ['no newlines' => '$', 'start \r\n' => "\r\n$", 'end \r\n' => "$\r\n", 'both \r\n' => "\r\n$\r\n", 'start \n' => "\n$", 'end \n' => "$\n", 'both \n' => "\n$\n"];
+
+        foreach ($variantQuotes as $quotesName => $variantQuote) {
+            foreach ($variantSpaces as $spaceName => $variantSpace) {
+                foreach ($variantNewlines as $newLineName => $variantNewline) {
+                    $href = $variantQuote
+                        .str_replace('$', str_replace('$', 'https://mautic.org', $variantSpace), $variantNewline)
+                        .$variantQuote;
+
+                    yield $quotesName.', '.$spaceName.', '.$newLineName => [
+                        'Ahoy <i>{contactfield=email}</i><a href='.$href.'>Mautic</a>',
+                        'single quote' === $quotesName,
+                    ];
+                }
+            }
+        }
+    }
+
+    public function testSegmentEmailSendWithAdvancedOptions(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+        $email   = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'Ahoy <i>{contactfield=email}</i><a href="https://mautic.org">Mautic</a>', $segment);
+        $email->setPlainText('Dear {contactfield=email}');
+        $email->setFromAddress('custom@from.address');
+        $email->setFromName('Custom From Name');
+        $email->setReplyToAddress('custom@replyto.address');
+        $email->setBccAddress('custom@bcc.address');
+        $email->setHeaders(['x-global-custom-header' => 'value123 overridden']);
+        $email->setUtmTags(
+            [
+                'utmSource'   => 'utmSourceA',
+                'utmMedium'   => 'utmMediumA',
+                'utmCampaign' => 'utmCampaignA',
+                'utmContent'  => 'utmContentA',
+            ]
+        );
+
+        $this->addContactsToSegment($segment, ['contact@one.email', 'contact@two.email']);
+        $this->em->persist($segment);
+        $this->em->persist($email);
+        $this->em->flush();
+
+        $this->sendBatchEmail($email);
+
+        $email = $this->getMailerMessage();
+        \assert($email instanceof MauticMessage);
+
+        // The order of the recipients is not guaranteed, so we need to check both possibilities.
+        Assert::assertSame('Subject A', $email->getSubject());
+        Assert::assertMatchesRegularExpression('#Ahoy <i>contact@(one|two)\.email<\/i><a href="https:\/\/localhost\/r\/[a-z0-9]+\?ct=[a-zA-Z0-9%]+&utm_source=utmSourceA&utm_medium=utmMediumA&utm_campaign=utmCampaignA&utm_content=utmContentA">Mautic<\/a><img height="1" width="1" src="https:\/\/localhost\/email\/[a-z0-9]+\.gif\?ct=[^"]+" alt="" \/>#', $email->getHtmlBody());
+        Assert::assertMatchesRegularExpression('#Dear contact@(one|two).email#', $email->getTextBody());
+        Assert::assertCount(1, $email->getFrom());
+        Assert::assertSame('Custom From Name', $email->getFrom()[0]->getName());
+        Assert::assertSame('custom@from.address', $email->getFrom()[0]->getAddress());
+        Assert::assertCount(1, $email->getTo());
+        Assert::assertSame('', $email->getTo()[0]->getName());
+        Assert::assertMatchesRegularExpression('#contact@(one|two).email#', $email->getTo()[0]->getAddress());
+        Assert::assertCount(1, $email->getReplyTo());
+        Assert::assertSame('', $email->getReplyTo()[0]->getName());
+        Assert::assertSame('custom@replyto.address', $email->getReplyTo()[0]->getAddress());
+        Assert::assertSame('value123', $email->getHeaders()->get('x-global-custom-header')->getBody());
+    }
+
+    public function testSegmentEmailSendWithTokenInFromAddress(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+        $email   = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'Ahoy <i>{contactfield=email}</i><a href="https://mautic.org">Mautic</a>', $segment);
+        $email->setPlainText('Dear {contactfield=email}');
+        $email->setFromAddress('{contactfield=address2}');
+        $email->setFromName('{contactfield=address1}');
+        $email->setReplyToAddress('custom@replyto.address');
+
+        $this->addContactsToSegment(
+            $segment,
+            ['contact@one.email', 'contact@two.email'],
+            function (Lead $contact, string $emailAddress) {
+                $contact->setAddress1('address1 name for '.$emailAddress);
+                $contact->setAddress2('address2+'.$emailAddress);
+            }
+        );
+
+        $this->em->persist($segment);
+        $this->em->persist($email);
+        $this->em->flush();
+
+        $this->sendBatchEmail($email, 2, 10, true);
+
+        /** @var MauticMessage[] $messages */
+        $messages   = self::getMailerMessages();
+        $messageOne = array_values(array_filter($messages, fn ($message) => 'contact@one.email' === $message->getTo()[0]->getAddress()))[0];
+        $messageTwo = array_values(array_filter($messages, fn ($message) => 'contact@two.email' === $message->getTo()[0]->getAddress()))[0];
+
+        Assert::assertSame('Subject A', $messageOne->getSubject());
+        Assert::assertMatchesRegularExpression('#Ahoy <i>contact@one\.email<\/i><a href="https:\/\/localhost\/r\/[a-z0-9]+\?ct=[a-zA-Z0-9%]+">Mautic<\/a><img height="1" width="1" src="https:\/\/localhost\/email\/[a-z0-9]+\.gif\?ct=[^"]+" alt="" \/>#', $messageOne->getHtmlBody());
+        Assert::assertSame('Dear contact@one.email', $messageOne->getTextBody());
+        Assert::assertCount(1, $messageOne->getFrom());
+        Assert::assertSame('address1 name for contact@one.email', $messageOne->getFrom()[0]->getName());
+        Assert::assertSame('address2+contact@one.email', $messageOne->getFrom()[0]->getAddress());
+        Assert::assertCount(1, $messageOne->getTo());
+        Assert::assertSame('', $messageOne->getTo()[0]->getName());
+        Assert::assertSame('contact@one.email', $messageOne->getTo()[0]->getAddress());
+        Assert::assertCount(1, $messageOne->getReplyTo());
+        Assert::assertSame('', $messageOne->getReplyTo()[0]->getName());
+        Assert::assertSame('custom@replyto.address', $messageOne->getReplyTo()[0]->getAddress());
+        Assert::assertSame('value123', $messageOne->getHeaders()->get('x-global-custom-header')->getBody());
+
+        Assert::assertSame('Subject A', $messageTwo->getSubject());
+        Assert::assertMatchesRegularExpression('#Ahoy <i>contact@two\.email<\/i><a href="https:\/\/localhost\/r\/[a-z0-9]+\?ct=[a-zA-Z0-9%]+">Mautic<\/a><img height="1" width="1" src="https:\/\/localhost\/email\/[a-z0-9]+\.gif\?ct=[^"]+" alt="" \/>#', $messageTwo->getHtmlBody());
+        Assert::assertSame('Dear contact@two.email', $messageTwo->getTextBody());
+        Assert::assertCount(1, $messageTwo->getFrom());
+        Assert::assertSame('address1 name for contact@two.email', $messageTwo->getFrom()[0]->getName());
+        Assert::assertSame('address2+contact@two.email', $messageTwo->getFrom()[0]->getAddress());
+        Assert::assertCount(1, $messageTwo->getTo());
+        Assert::assertSame('', $messageTwo->getTo()[0]->getName());
+        Assert::assertSame('contact@two.email', $messageTwo->getTo()[0]->getAddress());
+        Assert::assertCount(1, $messageTwo->getReplyTo());
+        Assert::assertSame('', $messageTwo->getReplyTo()[0]->getName());
+        Assert::assertSame('custom@replyto.address', $messageTwo->getReplyTo()[0]->getAddress());
+        Assert::assertSame('value123', $messageTwo->getHeaders()->get('x-global-custom-header')->getBody());
+    }
+
+    public function testCloneAction(): void
+    {
+        $segment = $this->createSegment('Segment B', 'segment-B');
+        $email   = $this->createEmail('Email B', 'Email B Subject', 'list', 'blank', 'Test html', $segment);
+        $this->em->flush();
+
+        // request for email clone
+        $crawler        = $this->client->request(Request::METHOD_GET, "/s/emails/clone/{$email->getId()}");
+        $buttonCrawler  =  $crawler->selectButton('Save & Close');
+        $form           = $buttonCrawler->form();
+        $form['emailform[emailType]']->setValue('list');
+        $form['emailform[subject]']->setValue('Email B Subject clone');
+        $form['emailform[name]']->setValue('Email B clone');
+        $form['emailform[isPublished]']->setValue('1');
+
+        $this->client->submit($form);
+        self::assertResponseIsSuccessful();
+
+        $emails = $this->em->getRepository(Email::class)->findBy([], ['id' => 'ASC']);
+        Assert::assertCount(2, $emails);
+
+        $firstEmail  = $emails[0];
+        $secondEmail = $emails[1];
+
+        Assert::assertSame($email->getId(), $firstEmail->getId());
+        Assert::assertNotSame($email->getId(), $secondEmail->getId());
+        Assert::assertEquals('list', $secondEmail->getEmailType());
+        Assert::assertEquals('Email B Subject', $firstEmail->getSubject());
+        Assert::assertEquals('Email B', $firstEmail->getName());
+        Assert::assertEquals('Email B Subject clone', $secondEmail->getSubject());
+        Assert::assertEquals('Email B clone', $secondEmail->getName());
+        Assert::assertEquals('Test html', $secondEmail->getCustomHtml());
+    }
+
+    public function testCloneWithTranslationsAndVariantsAction(): void
+    {
+        $segment = $this->createSegment('Segment C', 'segment-C');
+
+        $parent = $this->createEmail('Parent email', 'Parent subject', 'list', 'blank', 'Parent html', $segment);
+        $parent->setLanguage('en_US');
+        $parent->setIsPublished(true);
+
+        $translation = $this->createEmail('Parent French', 'French subject', 'list', 'blank', 'French html', $segment);
+        $translation->setLanguage('fr_FR');
+        $translation->setTranslationParent($parent);
+        $parent->addTranslationChild($translation);
+
+        $variantSettings = ['weight' => 50, 'winnerCriteria' => 'email.openrate'];
+        $variant         = $this->createEmail(
+            'Variant email',
+            'Variant subject',
+            'list',
+            'blank',
+            'Variant html',
+            $segment,
+            $variantSettings
+        );
+        $variant->setLanguage('en_US');
+        $variant->setVariantParent($parent);
+        $parent->addVariantChild($variant);
+
+        $variantTranslation = $this->createEmail(
+            'Variant French',
+            'Variant French subject',
+            'list',
+            'blank',
+            'Variant French html',
+            $segment
+        );
+        $variantTranslation->setLanguage('fr_FR');
+        $variantTranslation->setTranslationParent($variant);
+        $variant->addTranslationChild($variantTranslation);
+
+        $this->em->flush();
+
+        $this->client->request(Request::METHOD_GET, "/s/emails/view/{$parent->getId()}");
+        $this->assertStringContainsString(
+            "/s/emails/cloneWithTranslations/{$parent->getId()}",
+            $this->client->getResponse()->getContent()
+        );
+        $this->assertStringContainsString('Clone with translations and variants', $this->client->getResponse()->getContent());
+
+        $this->setCsrfHeader();
+        $this->client->xmlHttpRequest(
+            Request::METHOD_POST,
+            "/s/emails/cloneWithTranslations/{$parent->getId()}",
+        );
+        $this->assertResponseIsSuccessful();
+
+        $this->em->clear();
+        $emailRepository = $this->em->getRepository(Email::class);
+        $emails          = $emailRepository->findBy([], ['id' => 'ASC']);
+
+        Assert::assertCount(8, $emails);
+
+        $clonedParent             = $emailRepository->findOneBy(['name' => 'Parent email (copy)']);
+        $clonedTranslation        = $emailRepository->findOneBy(['name' => 'Parent French (copy)']);
+        $clonedVariant            = $emailRepository->findOneBy(['name' => 'Variant email (copy)']);
+        $clonedVariantTranslation = $emailRepository->findOneBy(['name' => 'Variant French (copy)']);
+
+        Assert::assertInstanceOf(Email::class, $clonedParent);
+        Assert::assertInstanceOf(Email::class, $clonedTranslation);
+        Assert::assertInstanceOf(Email::class, $clonedVariant);
+        Assert::assertInstanceOf(Email::class, $clonedVariantTranslation);
+
+        Assert::assertSame('list', $clonedParent->getEmailType());
+        Assert::assertFalse($clonedParent->isPublished(false));
+        Assert::assertSame(0, $clonedParent->getSentCount());
+        Assert::assertSame('Parent html', $clonedParent->getCustomHtml());
+        Assert::assertCount(1, $clonedParent->getLists());
+
+        Assert::assertSame($clonedParent->getId(), $clonedTranslation->getTranslationParent()->getId());
+        Assert::assertSame('fr_FR', $clonedTranslation->getLanguage());
+        Assert::assertSame('French html', $clonedTranslation->getCustomHtml());
+
+        Assert::assertSame($clonedParent->getId(), $clonedVariant->getVariantParent()->getId());
+        Assert::assertSame($variantSettings, $clonedVariant->getVariantSettings());
+        Assert::assertSame('Variant html', $clonedVariant->getCustomHtml());
+
+        Assert::assertSame($clonedVariant->getId(), $clonedVariantTranslation->getTranslationParent()->getId());
+        Assert::assertSame('fr_FR', $clonedVariantTranslation->getLanguage());
+        Assert::assertSame('Variant French html', $clonedVariantTranslation->getCustomHtml());
+    }
+
+    public function testEmailDetailsPageShouldNotHavePendingCount(): void
+    {
+        $segment = $this->createSegment('Test Segment A', 'test-segment-a');
+        $email   = $this->createEmail('Test Email C', 'Test Email C Subject', 'list', 'blank', 'Test html', $segment);
+        $this->em->flush();
+
+        $this->client->enableProfiler();
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/view/{$email->getId()}");
+
+        // checking if pending count is removed from details page ui
+        $emailDetailsContainer = trim($crawler->filter('#email-details')->filter('tbody')->text());
+        $this->assertStringNotContainsString('Pending', $emailDetailsContainer);
+
+        $profile = $this->client->getProfile();
+
+        /** @var DoctrineDataCollector $dbCollector */
+        $dbCollector = $profile->getCollector('db');
+        $queries     = $dbCollector->getQueries();
+        $prefix      = self::getContainer()->getParameter('mautic.db_table_prefix');
+
+        $pendingCountQuery = array_filter(
+            $queries['default'],
+            function (array $query) use ($prefix, $segment, $email) {
+                return $query['sql'] === "SELECT count(*) as count FROM {$prefix}leads l WHERE (EXISTS (SELECT null FROM {$prefix}lead_lists_leads ll WHERE (ll.lead_id = l.id) AND (ll.leadlist_id IN ({$segment->getId()})) AND (ll.manually_removed = :false))) AND (NOT EXISTS (SELECT null FROM {$prefix}lead_donotcontact dnc WHERE (dnc.lead_id = l.id) AND (dnc.channel = 'email'))) AND (NOT EXISTS (SELECT null FROM {$prefix}email_stats stat WHERE (stat.lead_id = l.id) AND (stat.email_id IN ({$email->getId()})))) AND (NOT EXISTS (SELECT null FROM {$prefix}message_queue mq WHERE (mq.lead_id = l.id) AND (mq.status <> 'sent') AND (mq.channel = 'email') AND (mq.channel_id IN ({$email->getId()})))) AND ((l.email IS NOT NULL) AND (l.email <> ''))";
+            }
+        );
+
+        $this->assertCount(0, $pendingCountQuery);
+    }
+
+    public function testAbTestAction(): void
+    {
+        $segment        = $this->createSegment('Segment B', 'segment-B');
+        $varientSetting = ['totalWeight' => 100, 'winnerCriteria' => 'email.openrate'];
+        $email          = $this->createEmail('Email B', 'Email B Subject', 'list', 'blank', 'Test html', $segment, $varientSetting);
+        $this->em->flush();
+
+        // request for email clone
+        $crawler        = $this->client->request(Request::METHOD_GET, "/s/emails/abtest/{$email->getId()}");
+        $buttonCrawler  =  $crawler->selectButton('Save & Close');
+        $form           = $buttonCrawler->form();
+        $form['emailform[subject]']->setValue('Email B Subject var 2');
+        $form['emailform[name]']->setValue('Email B var 2');
+        $form['emailform[variantSettings][weight]']->setValue((string) $varientSetting['totalWeight']);
+        $form['emailform[variantSettings][winnerCriteria]']->setValue($varientSetting['winnerCriteria']);
+        $form['emailform[isPublished]']->setValue('1');
+
+        $this->client->submit($form);
+        self::assertResponseIsSuccessful();
+
+        $emails = $this->em->getRepository(Email::class)->findBy([], ['id' => 'ASC']);
+        Assert::assertCount(2, $emails);
+
+        $firstEmail  = $emails[0];
+        $secondEmail = $emails[1];
+
+        Assert::assertSame($email->getId(), $firstEmail->getId());
+        Assert::assertNotSame($email->getId(), $secondEmail->getId());
+        Assert::assertEquals('list', $secondEmail->getEmailType());
+        Assert::assertEquals('Email B Subject', $firstEmail->getSubject());
+        Assert::assertEquals('Email B', $firstEmail->getName());
+        Assert::assertEquals('Email B Subject var 2', $secondEmail->getSubject());
+        Assert::assertEquals('Email B var 2', $secondEmail->getName());
+        Assert::assertEquals('blank', $secondEmail->getTemplate());
+        Assert::assertEquals('Test html', $secondEmail->getCustomHtml());
+        Assert::assertEquals($firstEmail->getId(), $secondEmail->getVariantParent()->getId());
+    }
+
+    #[DataProvider('dwcTokenTypeDataProvider')]
+    public function testSaveEmailWithHtmlTypeDWC(string $type): void
+    {
+        $dwc            = $this->createDynamicContent($type);
+        $subject        = sprintf('Email with DWC {dwc=%s}', $dwc->getSlotName());
+        $crawler        = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $buttonCrawler  =  $crawler->selectButton('Save & Close');
+        $form           = $buttonCrawler->form();
+        $form['emailform[emailType]']->setValue('template');
+        $form['emailform[subject]']->setValue($subject);
+        $form['emailform[name]']->setValue('Email A');
+        $form['emailform[template]']->setValue('blank');
+        $form['emailform[customHtml]']->setValue('<html><body><p>some text</p></body></html>');
+        $form['emailform[isPublished]']->setValue('1');
+
+        $this->client->submit($form);
+        self::assertResponseIsSuccessful();
+        $errString = sprintf('The Dynamic Content slot &#039;%s&#039; is not of type &#039;text&#039;.', $dwc->getSlotName());
+        if (TypeList::TEXT === $type) {
+            $this->assertStringNotContainsString($errString, $this->client->getResponse()->getContent());
+        } else {
+            $this->assertStringContainsString($errString, $this->client->getResponse()->getContent());
+        }
+    }
+
+    /**
+     * @return iterable<string, string[]>
+     */
+    public static function dwcTokenTypeDataProvider(): iterable
+    {
+        yield 'text' => [TypeList::TEXT];
+        yield 'html' => [TypeList::HTML];
+    }
+
+    public function testEmailWithProject(): void
+    {
+        $email = $this->createEmail('Email', 'Subject', 'template', 'blank', 'html');
+
+        $project = new Project();
+        $project->setName('Test Project');
+        $this->em->persist($project);
+
+        $this->em->flush();
+        $this->em->clear();
+
+        $crawler = $this->client->request('GET', '/s/emails/edit/'.$email->getId());
+        $form    = $crawler->selectButton('Save')->form();
+        $form['emailform[projects]']->setValue((string) $project->getId());
+
+        $this->client->submit($form);
+
+        $this->assertResponseIsSuccessful();
+
+        $savedEmail = $this->em->find(Email::class, $email->getId());
+        Assert::assertSame($project->getId(), $savedEmail->getProjects()->first()->getId());
+    }
+
+    public function testOptimisticLock(): void
+    {
+        $version = 1;
+        $email   = $this->createEmail('Email', 'Subject', 'template', 'blank', 'html');
+        $this->em->flush();
+        $this->assertEmailVersion($email->getId(), $version);
+
+        $crawler = $this->client->request('GET', '/s/emails/edit/'.$email->getId());
+        $form    = $crawler->selectButton('Save')->form();
+        $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+        $this->assertEmailVersion($email->getId(), ++$version, 'The version should be incremented after submitting the form.');
+
+        $form    = $crawler->selectButton('Save')->form();
+        $crawler = $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+        $this->assertEmailVersion($email->getId(), $version, 'The version should stay the same as there was an optimistic lock error.');
+        Assert::assertStringContainsString(
+            'The record you are updating has been changed by someone else in the meantime. Please refresh the browser window and re-submit your changes.',
+            $crawler->text(), 'There should be an optimistic error as the form was not refreshed after the previous submission.',
+        );
+    }
+
+    /**
+     * @param array<mixed> $emails
+     *
+     * @throws \Doctrine\ORM\Exception\ORMException
+     */
+    private function addContactsToSegment(LeadList $segment, array $emails, ?callable $contactCallback = null): void
+    {
+        foreach ($emails as $emailAddress) {
+            $contact = new Lead();
+            $contact->setEmail($emailAddress);
+
+            if ($contactCallback) {
+                $contactCallback($contact, $emailAddress);
+            }
+
+            $member = new ListLead();
+            $member->setLead($contact);
+            $member->setList($segment);
+            $member->setDateAdded(new \DateTime());
+
+            $this->em->persist($member);
+            $this->em->persist($contact);
+        }
+    }
+
+    /**
+     * Helper method to send batch email and assert common response expectations.
+     */
+    private function sendBatchEmail(Email $email, int $pending = 2, int $batchLimit = 10, bool $setCsrf = false): void
+    {
+        if ($setCsrf) {
+            $this->setCsrfHeader();
+        }
+
+        $this->client->request(Request::METHOD_POST, '/s/ajax?action=email:sendBatch', [
+            'id'         => $email->getId(),
+            'pending'    => $pending,
+            'batchLimit' => $batchLimit,
+        ]);
+
+        $this->assertResponseIsSuccessful();
+        $this->assertSame('{"success":1,"percent":100,"progress":[2,2],"stats":{"sent":2,"failed":0,"failedRecipients":[]}}', $this->client->getResponse()->getContent());
+        $this->assertQueuedEmailCount(2);
+    }
+
+    public function testPublishPermissionOnNewEmailForAdminUser(): void
+    {
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $this->assertResponseIsSuccessful();
+        $isUnpublishedInput = $crawler->filter('input[name="emailform[isPublished]"][value="0"]:not([disabled="disabled"][checked])');
+        $isPublishedInput   = $crawler->filter('input[name="emailform[isPublished]"][value="1"][checked]:not([disabled="disabled"])');
+        $publishUpInput     = $crawler->filter('input[name="emailform[publishUp]"]:not([disabled="disabled"])');
+        $publishDownInput   = $crawler->filter('input[name="emailform[publishDown]"]:not([disabled="disabled"])');
+        Assert::assertCount(1, $isUnpublishedInput, 'The unpublished field should be found, unchecked and enabled.');
+        Assert::assertCount(1, $isPublishedInput, 'The published field should be found, checked and enabled.');
+        Assert::assertCount(1, $publishUpInput, 'The publish up field should be found and enabled.');
+        Assert::assertCount(1, $publishDownInput, 'The publish down field should be found and enabled.');
+
+        $form = $crawler->selectButton('Save & Close')->form();
+        $form['emailform[emailType]']->setValue('template');
+        $form['emailform[subject]']->setValue('Email publish test');
+        $form['emailform[name]']->setValue('Email publish test');
+        $form['emailform[template]']->setValue('blank');
+
+        $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+
+        $email = $this->em->getRepository(Email::class)->findOneBy(['name' => 'Email publish test']);
+        Assert::assertTrue($email->getIsPublished());
+    }
+
+    /**
+     * @param string[] $permissions
+     */
+    #[DataProvider('createPermissionDataProvider')]
+    public function testPublishPermissionOnCreate(array $permissions, bool $expectDisabled, bool $publishedByDefault, bool $publishAfterSave): void
+    {
+        // Set user to be able to create emails, but not publish them.
+        $user = $this->em->getRepository(User::class)->findOneBy(['username' => 'sales']);
+        $this->setPermission($user->getRole(), ['email:emails' => $permissions]);
+        $this->loginUser($user);
+        $this->client->setServerParameter('PHP_AUTH_USER', 'sales');
+        $this->client->setServerParameter('PHP_AUTH_PW', 'Maut1cR0cks!');
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $this->assertResponseIsSuccessful();
+        $isUnpublishedInput = $crawler->filter('input[name="emailform[isPublished]"][value="0"]');
+        Assert::assertCount(1, $isUnpublishedInput, 'The unpublished field should be found.');
+        Assert::assertSame($expectDisabled, !is_null($isUnpublishedInput->attr('disabled')));
+        Assert::assertSame($publishedByDefault, is_null($isUnpublishedInput->attr('checked')));
+
+        $isPublishedInput = $crawler->filter('input[name="emailform[isPublished]"][value="1"]');
+        Assert::assertCount(1, $isPublishedInput, 'The unpublished field should be found.');
+        Assert::assertSame($expectDisabled, !is_null($isPublishedInput->attr('disabled')));
+        Assert::assertSame($publishedByDefault, !is_null($isPublishedInput->attr('checked')));
+
+        $publishUpInput   = $crawler->filter('input[name="emailform[publishUp]"]');
+        $publishDownInput = $crawler->filter('input[name="emailform[publishDown]"]');
+        Assert::assertSame($expectDisabled, !is_null($publishUpInput->attr('disabled')));
+        Assert::assertSame($expectDisabled, !is_null($publishDownInput->attr('disabled')));
+
+        $form = $crawler->selectButton('Save & Close')->form();
+        $form['emailform[emailType]']->setValue('template');
+        $form['emailform[subject]']->setValue('Email publish test');
+        $form['emailform[name]']->setValue('Email publish test');
+        $form['emailform[template]']->setValue('blank');
+
+        $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+
+        $email = $this->em->getRepository(Email::class)->findOneBy(['name' => 'Email publish test']);
+        Assert::assertSame($publishAfterSave, $email->getIsPublished());
+    }
+
+    /**
+     * @return iterable<string, mixed[]>
+     */
+    public static function createPermissionDataProvider(): iterable
+    {
+        yield 'user cannot publish without publish permission' => [
+            'permissions'        => ['create'],
+            'expectDisabled'     => true,
+            'publishedByDefault' => false,
+            'publishAfterSave'   => false,
+        ];
+
+        yield 'user can publish other with just publish own permission' => [
+            'permissions'        => ['create', 'publishown'],
+            'expectDisabled'     => false,
+            'publishedByDefault' => true,
+            'publishAfterSave'   => true,
+        ];
+
+        yield 'user cannot publish own with just publish other permission' => [
+            'permissions'        => ['create', 'publishother'],
+            'expectDisabled'     => true,
+            'publishedByDefault' => false,
+            'publishAfterSave'   => false,
+        ];
+    }
+
+    public function testPublishPermissionOnEditEmailForAdminUser(): void
+    {
+        $email = $this->createEmail('Email A', 'Email A Subject', 'template', 'blank', 'Test html');
+        $this->em->flush();
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/edit/{$email->getId()}");
+        $this->assertResponseIsSuccessful();
+        $isUnpublishedInput = $crawler->filter('input[name="emailform[isPublished]"][value="0"]:not([disabled="disabled"][checked])');
+        $isPublishedInput   = $crawler->filter('input[name="emailform[isPublished]"][value="1"][checked]:not([disabled="disabled"])');
+        $publishUpInput     = $crawler->filter('input[name="emailform[publishUp]"]:not([disabled="disabled"])');
+        $publishDownInput   = $crawler->filter('input[name="emailform[publishDown]"]:not([disabled="disabled"])');
+        Assert::assertCount(1, $isUnpublishedInput, 'The unpublished field should be found, unchecked and enabled.');
+        Assert::assertCount(1, $isPublishedInput, 'The published field should be found, checked and enabled.');
+        Assert::assertCount(1, $publishUpInput, 'The publish up field should be found and enabled.');
+        Assert::assertCount(1, $publishDownInput, 'The publish down field should be found and enabled.');
+    }
+
+    /**
+     * @param string[] $permissions
+     */
+    #[DataProvider('editPermissionDataProvider')]
+    public function testPublishPermissionOnEdit(string $owner, string $user, array $permissions, bool $expectDisabled, bool $publishAfterSave): void
+    {
+        $ownerUser  = $this->em->getRepository(User::class)->findOneBy(['username' => $owner]);
+        $email      = $this->createEmail('Email A', 'Email A Subject', 'template', 'blank', 'Test html');
+        $email->setCreatedBy($ownerUser);
+        $this->em->flush();
+
+        // Set user to be able to create emails, but not publish them.
+        $loggedInUser = $this->em->getRepository(User::class)->findOneBy(['username' => $user]);
+        $this->setPermission($loggedInUser->getRole(), ['email:emails' => $permissions]);
+
+        $this->loginUser($loggedInUser);
+        $this->client->setServerParameter('PHP_AUTH_USER', $loggedInUser->getUserIdentifier());
+        $this->client->setServerParameter('PHP_AUTH_PW', 'Maut1cR0cks!');
+
+        // Check that the publish button is disabled and set to unpublish for the sales user.
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/edit/{$email->getId()}");
+        $this->assertResponseIsSuccessful();
+
+        $isUnpublishedInput = $crawler->filter('input[name="emailform[isPublished]"][value="0"]');
+        Assert::assertCount(1, $isUnpublishedInput, 'The unpublished field should be found.');
+        Assert::assertSame($expectDisabled, !is_null($isUnpublishedInput->attr('disabled')));
+        Assert::assertTrue(is_null($isUnpublishedInput->attr('checked')));
+
+        $isPublishedInput = $crawler->filter('input[name="emailform[isPublished]"][value="1"]');
+        Assert::assertCount(1, $isPublishedInput, 'The unpublished field should be found.');
+        Assert::assertSame($expectDisabled, !is_null($isPublishedInput->attr('disabled')));
+        Assert::assertTrue(!is_null($isPublishedInput->attr('checked')));
+
+        $publishUpInput   = $crawler->filter('input[name="emailform[publishUp]"]');
+        $publishDownInput = $crawler->filter('input[name="emailform[publishDown]"]');
+        Assert::assertSame($expectDisabled, !is_null($publishUpInput->attr('disabled')));
+        Assert::assertSame($expectDisabled, !is_null($publishDownInput->attr('disabled')));
+
+        $form = $crawler->selectButton('Save & Close')->form();
+        $form['emailform[emailType]']->setValue('template');
+        $form['emailform[subject]']->setValue('Email publish test');
+        $form['emailform[name]']->setValue('Email publish test');
+        $form['emailform[template]']->setValue('blank');
+        $form['emailform[isPublished]']->setValue('0'); // Tries to change the email to unpublished.
+
+        $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+
+        $email = $this->em->getRepository(Email::class)->findOneBy(['name' => 'Email publish test']);
+        Assert::assertSame($publishAfterSave, $email->getIsPublished());
+    }
+
+    /**
+     * @return iterable<string, mixed[]>
+     */
+    public static function editPermissionDataProvider(): iterable
+    {
+        yield 'user cannot publish without publish permission' => [
+            'owner'            => 'sales',
+            'user'             => 'sales',
+            'permissions'      => ['editown', 'editother'],
+            'expectDisabled'   => true,
+            'publishAfterSave' => true,
+        ];
+
+        yield 'user cannot publish other with just publish own permission' => [
+            'owner'            => 'admin',
+            'user'             => 'sales',
+            'permissions'      => ['editown', 'editother', 'publishown'],
+            'expectDisabled'   => true,
+            'publishAfterSave' => true,
+        ];
+
+        yield 'user cannot publish own with just publish other permission' => [
+            'owner'            => 'sales',
+            'user'             => 'sales',
+            'permissions'      => ['editown', 'editother', 'publishother'],
+            'expectDisabled'   => true,
+            'publishAfterSave' => true,
+        ];
+
+        yield 'user can publish own with just publish own permission' => [
+            'owner'            => 'sales',
+            'user'             => 'sales',
+            'permissions'      => ['editown', 'editother', 'publishown'],
+            'expectDisabled'   => false,
+            'publishAfterSave' => false,
+        ];
+
+        yield 'user can publish other with just publish other permission' => [
+            'owner'            => 'admin',
+            'user'             => 'sales',
+            'permissions'      => ['editown', 'editother', 'publishother'],
+            'expectDisabled'   => false,
+            'publishAfterSave' => false,
+        ];
+    }
+
+    public function testSendEmailForImportCustomEmailTemplate(): void
+    {
+        $email = new Email();
+        $email->setName('Test Email C');
+        $email->setSubject('Test Email C Subject');
+        $email->setTemplate('blank');
+        $email->setEmailType('template');
+
+        $contact = new Lead();
+        $contact->setEmail('john@doe.email');
+
+        $this->em->persist($email);
+        $this->em->persist($contact);
+        $this->em->flush();
+
+        // Create the member now.
+        $payload = [
+            'action'   => 'lead:getEmailTemplate',
+            'template' => $email->getId(),
+        ];
+
+        $this->client->xmlHttpRequest('GET', '/s/ajax', $payload);
+        $clientResponse = $this->client->getResponse();
+
+        $this->assertResponseIsSuccessful();
+
+        $response = json_decode($clientResponse->getContent(), true);
+
+        $this->assertSame(1, $response['success']);
+        $this->assertNotEmpty($response['subject']);
+        $this->assertEquals($email->getSubject(), $response['subject']);
+        $this->assertNotEmpty($response['body']);
+    }
+
+    public function testSegmentEmailSendWithoutContinueSending(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+
+        $email = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'Ahoy <i>{contactfield=email}</i><a href="https://mautic.org">Mautic</a>', $segment);
+        $this->em->persist($email);
+        $this->em->flush();
+
+        // Schedule the email to be sent
+        $crawler       = $this->client->request(Request::METHOD_GET, "/s/emails/scheduleSend/{$email->getId()}");
+        $form          = $crawler->selectButton('schedule_send[buttons][save]')->form();
+
+        // Set publish up date to 1 hour ago
+        $publishUpDate = (new \DateTime('now -30 minutes'))->format('Y-m-d H:i');
+        $form['schedule_send[publishUp]']->setValue($publishUpDate);
+        $form['schedule_send[continueSending]']->setValue('0');
+
+        $this->client->submit($form);
+
+        // Create test contacts and add them to the segment
+        foreach (['test@one.email', 'test@two.email', 'test@three.email'] as $emailAddress) {
+            $contact = new Lead();
+            $contact->setEmail($emailAddress);
+
+            $member = new ListLead();
+            $member->setLead($contact);
+            $member->setList($segment);
+            if ('test@three.email' === $emailAddress) {
+                $member->setDateAdded(new \DateTime('-10 minutes'));
+            } else {
+                $member->setDateAdded(new \DateTime('-1 hour'));
+            }
+
+            $this->em->persist($member);
+            $this->em->persist($contact);
+        }
+
+        $this->em->flush();
+
+        $commandTester = $this->testSymfonyCommand('mautic:broadcast:send', ['--channel' => 'email', '--id' => $email->getId()]);
+        $this->assertStringContainsString('Email: Email A | 2', $commandTester->getDisplay());
+
+        $commandTester = $this->testSymfonyCommand('mautic:broadcast:send', ['--channel' => 'email', '--id' => $email->getId()]);
+
+        $email = $this->em->getRepository(Email::class)->find($email->getId());
+        $this->assertFalse($email->getIsPublished(), $commandTester->getDisplay());
+    }
+
+    public function testSegmentEmailSendWithContinueSending(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+
+        $email = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'Ahoy <i>{contactfield=email}</i><a href="https://mautic.org">Mautic</a>', $segment);
+        $this->em->persist($email);
+        $this->em->flush($email);
+
+        // Schedule the email to be sent
+        $crawler       = $this->client->request(Request::METHOD_GET, "/s/emails/scheduleSend/{$email->getId()}");
+        $form          = $crawler->selectButton('schedule_send[buttons][save]')->form();
+
+        // Set publish up date to 1 hour ago
+        $publishUpDate = (new \DateTime('now -1 hour'))->format('Y-m-d H:i');
+        $form['schedule_send[publishUp]']->setValue($publishUpDate);
+        $form['schedule_send[continueSending]']->setValue('1');
+
+        $this->client->submit($form);
+
+        foreach (['test@one.email', 'test@two.email', 'test@three.email'] as $emailAddress) {
+            $contact = new Lead();
+            $contact->setEmail($emailAddress);
+
+            $member = new ListLead();
+            $member->setLead($contact);
+            $member->setList($segment);
+            if ('test@three.email' === $emailAddress) {
+                $member->setDateAdded(new \DateTime('-10 minutes'));
+            } else {
+                $member->setDateAdded(new \DateTime('-1 hour'));
+            }
+
+            $this->em->persist($member);
+            $this->em->persist($contact);
+        }
+
+        $this->em->flush();
+
+        $commandTester = $this->testSymfonyCommand('mautic:broadcast:send', ['--channel' => 'email', '--id' => $email->getId()]);
+        $this->assertStringContainsString('Email: Email A | 3', $commandTester->getDisplay());
+
+        $commandTester = $this->testSymfonyCommand('mautic:broadcast:send', ['--channel' => 'email', '--id' => $email->getId()]);
+
+        $email = $this->em->getRepository(Email::class)->find($email->getId());
+        $this->assertTrue($email->getIsPublished(), $commandTester->getDisplay());
+    }
+
+    public function testSegmentEmailCancelScheduling(): void
+    {
+        $segment = $this->createSegment('Segment A', 'segment-a');
+
+        $email = $this->createEmail('Email A', 'Subject A', 'list', 'blank', 'Ahoy <i>{contactfield=email}</i><a href="https://mautic.org">Mautic</a>', $segment);
+        $this->em->persist($email);
+        $this->em->flush($email);
+
+        // Schedule the email to be sent
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/scheduleSend/{$email->getId()}");
+        $form    = $crawler->selectButton('schedule_send[buttons][save]')->form();
+
+        // Set publish up date to 1 hour ago
+        $publishUpDate = (new \DateTime('now'))->format('Y-m-d H:i');
+        $form['schedule_send[publishUp]']->setValue($publishUpDate);
+
+        $this->client->submit($form);
+
+        // Schedule the email to be sent
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/scheduleSend/{$email->getId()}");
+        $form    = $crawler->selectButton('schedule_send[buttons][apply]')->form();
+        $this->client->submit($form);
+
+        $email = $this->em->getRepository(Email::class)->find($email->getId());
+        $this->assertNull($email->getPublishUp());
+    }
+
+    private function createDynamicContent(string $type): DynamicContent
+    {
+        $dynamicContent = new DynamicContent();
+        $dynamicContent->setName('Dynamic content');
+        $dynamicContent->setType($type);
+        $dynamicContent->setIsCampaignBased(false);
+        $dynamicContent->setSlotName('slot-name');
+        $dynamicContent->setContent('text content');
+        $dynamicContent->setFilters([
+            [
+                'glue'     => 'and',
+                'field'    => 'email',
+                'object'   => 'lead',
+                'type'     => 'email',
+                'filter'   => null,
+                'display'  => null,
+                'operator' => '!empty',
+            ],
+        ]);
+        $this->em->persist($dynamicContent);
+
+        return $dynamicContent;
+    }
+
+    /**
+     * @throws \Doctrine\ORM\Exception\ORMException
+     * @throws OptimisticLockException
+     * @throws TransactionRequiredException
+     */
+    #[DataProvider('getEditEmailForTranslationProvider')]
+    public function testEditEmailForTranslation(
+        string $parentType,
+        string $childType,
+        string $parentField,
+        bool $useSegment,
+    ): void {
+        $segment = $useSegment ? $this->createSegment('Segment A', 'segment-a') : null;
+
+        $parentEmail = $this->createEmail('Parent Email', 'template', $parentType, 'blank', 'Test html', $segment);
+        $childEmail  = $this->createEmail('Child Email', 'template', $childType, 'blank', 'Test html', $segment);
+
+        $this->em->persist($parentEmail);
+        $this->em->persist($childEmail);
+        $this->em->flush();
+
+        $crawler = $this->client->request(Request::METHOD_GET, "/s/emails/edit/{$childEmail->getId()}");
+        $this->assertResponseIsSuccessful();
+
+        $form = $crawler->selectButton('Save')->form();
+        $form->setValues([
+            'emailform[name]'            => 'Child Email - Updated',
+            "emailform[$parentField]"    => $parentEmail->getId(),
+        ]);
+
+        $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+
+        /** @var Email $updatedChild */
+        $updatedChild      = $this->em->find(Email::class, $childEmail->getId());
+        $translationParent = $updatedChild->getTranslationParent();
+        \assert($translationParent instanceof Email || null === $translationParent);
+
+        $this->assertNotNull($translationParent, 'Translation parent should be set.');
+        $this->assertSame(
+            $parentEmail->getId(),
+            $translationParent->getId(),
+            'Child email should have the parent email set for translation.'
+        );
+    }
+
+    /**
+     * @return iterable<string, array{parentType: string, childType: string, parentField: string, useSegment: bool}>
+     */
+    public static function getEditEmailForTranslationProvider(): iterable
+    {
+        yield 'Segment email' => [
+            'parentType'   => 'list',
+            'childType'    => 'list',
+            'parentField'  => 'segmentTranslationParent',
+            'useSegment'   => true,
+        ];
+
+        yield 'Template email' => [
+            'parentType'   => 'template',
+            'childType'    => 'template',
+            'parentField'  => 'templateTranslationParent',
+            'useSegment'   => false,
+        ];
+    }
+
+    /**
+     * Test email name length validation (190 character limit).
+     */
+    public function testEmailNameLengthValidation(): void
+    {
+        $longName = str_repeat('a', Email::MAX_NAME_SUBJECT_LENGTH + 1); // 191 characters
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $this->assertResponseIsSuccessful();
+
+        $form = $crawler->selectButton('emailform[buttons][save]')->form();
+        $form['emailform[name]']->setValue($longName);
+        $form['emailform[subject]']->setValue('Valid Subject');
+        $form['emailform[emailType]']->setValue('template');
+
+        $this->client->submit($form);
+
+        $response = $this->client->getResponse();
+        $this->assertStringContainsString('Email name maximum length is 190 characters', $response->getContent());
+    }
+
+    #[DataProvider('provideFromAddressValidationValues')]
+    public function testFromAddressAllowsEmailOrContactFieldToken(string $fromAddress, bool $expectSaved): void
+    {
+        $name    = sprintf('From address validation %s', md5($fromAddress));
+        $subject = sprintf('Subject %s', md5($fromAddress));
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $this->assertResponseIsSuccessful();
+
+        $form = $crawler->selectButton('emailform[buttons][save]')->form();
+        $form['emailform[name]']->setValue($name);
+        $form['emailform[subject]']->setValue($subject);
+        $form['emailform[emailType]']->setValue('template');
+        $form['emailform[template]']->setValue('blank');
+        $form['emailform[customHtml]']->setValue('content');
+        $form['emailform[fromAddress]']->setValue($fromAddress);
+
+        $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+
+        $email = $this->em->getRepository(Email::class)->findOneBy(['name' => $name]);
+
+        if ($expectSaved) {
+            $this->assertInstanceOf(Email::class, $email);
+            $this->assertSame($fromAddress, $email->getFromAddress());
+
+            return;
+        }
+
+        $this->assertNull($email);
+        $this->assertStringContainsString($fromAddress, $this->client->getResponse()->getContent());
+    }
+
+    /**
+     * @return iterable<string, array{fromAddress: string, expectSaved: bool}>
+     */
+    public static function provideFromAddressValidationValues(): iterable
+    {
+        yield 'standard email address is valid' => [
+            'fromAddress' => 'sender@nowhere.com',
+            'expectSaved' => true,
+        ];
+
+        yield 'email token is valid for email field alias' => [
+            'fromAddress' => '{contactfield=email|fallback@nowhere.com}',
+            'expectSaved' => true,
+        ];
+
+        yield 'plain invalid value is rejected' => [
+            'fromAddress' => 'not-an-email-or-token',
+            'expectSaved' => false,
+        ];
+
+        yield 'csv from addresses are rejected' => [
+            'fromAddress' => 'sender1@nowhere.com, sender2@nowhere.com',
+            'expectSaved' => false,
+        ];
+    }
+
+    public function testInvalidFromAddressMarksAdvancedTabAndShowsSingleError(): void
+    {
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $this->assertResponseIsSuccessful();
+
+        $form = $crawler->selectButton('emailform[buttons][save]')->form();
+        $form['emailform[name]']->setValue('Invalid advanced from address');
+        $form['emailform[subject]']->setValue('Invalid advanced from address');
+        $form['emailform[emailType]']->setValue('template');
+        $form['emailform[template]']->setValue('blank');
+        $form['emailform[customHtml]']->setValue('content');
+        $form['emailform[fromAddress]']->setValue('{contactfieldd=companyemail|info@default.com}');
+
+        $crawler = $this->client->submit($form);
+        $this->assertResponseIsSuccessful();
+
+        $matchingAlerts = array_filter(
+            $crawler->filter('.alert.alert-danger')->each(
+                static fn ($node): string => trim($node->text())
+            ),
+            static fn (string $text): bool => str_contains($text, 'is not an email address nor a token built on an email field type.')
+        );
+
+        $this->assertCount(1, $matchingAlerts);
+        $this->assertCount(1, $crawler->filter('a[href="#advanced-container"] span.text-danger'));
+    }
+
+    /**
+     * Test email subject length validation (190 character limit).
+     */
+    public function testEmailSubjectLengthValidation(): void
+    {
+        $longSubject = str_repeat('b', Email::MAX_NAME_SUBJECT_LENGTH + 1); // 191 characters
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $this->assertResponseIsSuccessful();
+
+        $form = $crawler->selectButton('emailform[buttons][save]')->form();
+        $form['emailform[name]']->setValue('Valid Name');
+        $form['emailform[subject]']->setValue($longSubject);
+        $form['emailform[emailType]']->setValue('template');
+
+        $this->client->submit($form);
+
+        $response = $this->client->getResponse();
+        $this->assertStringContainsString('Email subject maximum length is 190 characters', $response->getContent());
+    }
+
+    /**
+     * Test that long email name with empty subject doesn't cause server error.
+     * This addresses issue #15394 where TextOnlyDynamicContentValidator
+     * threw UnexpectedTypeException for null subject values.
+     */
+    public function testLongNameWithEmptySubjectValidation(): void
+    {
+        $longName = str_repeat('a', Email::MAX_NAME_SUBJECT_LENGTH + 1); // 191 characters
+
+        $crawler = $this->client->request(Request::METHOD_GET, '/s/emails/new');
+        $this->assertResponseIsSuccessful();
+
+        $form = $crawler->selectButton('emailform[buttons][save]')->form();
+        $form['emailform[name]']->setValue($longName);
+        $form['emailform[emailType]']->setValue('template');
+
+        $this->client->submit($form);
+
+        $response = $this->client->getResponse();
+
+        // Should return validation errors, NOT a 500 server error
+        $this->assertTrue($response->isOk() || $response->isClientError());
+        $this->assertFalse($response->isServerError(), 'Should not return 500 server error for empty subject with long name');
+
+        // Should contain validation messages for both name length and subject being required
+        $content = $response->getContent();
+        $this->assertStringContainsString('Email name maximum length is 190 characters', $content);
+    }
+
+    private function createSegment(string $name, string $alias): LeadList
+    {
+        $segment = new LeadList();
+        $segment->setName($name);
+        $segment->setAlias($alias);
+        $segment->setPublicName($name);
+        $this->em->persist($segment);
+
+        return $segment;
+    }
+
+    /**
+     * @return string[]
+     */
+    private function getClickCountUrls(Crawler $crawler): array
+    {
+        return $crawler->filter('.click-list tbody tr td.long-text a')->each(
+            fn (Crawler $node): string => (string) $node->attr('href')
+        );
+    }
+
+    /**
+     * @param mixed[]|null $varientSetting
+     */
+    private function createEmail(string $name, string $subject, string $emailType, string $template, string $customHtml, ?LeadList $segment = null, ?array $varientSetting = []): Email
+    {
+        $email = new Email();
+        $email->setName($name);
+        $email->setSubject($subject);
+        $email->setEmailType($emailType);
+        $email->setTemplate($template);
+        $email->setCustomHtml($customHtml);
+        $email->setVariantSettings($varientSetting);
+        if (!empty($segment)) {
+            $email->addList($segment);
+        }
+        $this->em->persist($email);
+
+        return $email;
+    }
+
+    /**
+     * @param array<string, string[]> $permissions
+     */
+    private function setPermission(Role $role, array $permissions): void
+    {
+        $roleModel = $this->getContainer()->get('mautic.user.model.role');
+        $roleModel->setRolePermissions($role, $permissions);
+        $this->em->persist($role);
+        $this->em->flush();
+    }
+
+    private function assertEmailVersion(int $id, int $expectedVersion, string $message = ''): void
+    {
+        $this->em->clear();
+        $email = $this->em->find(Email::class, $id);
+        Assert::assertSame($expectedVersion, $email->getVersion(), $message);
+    }
+}

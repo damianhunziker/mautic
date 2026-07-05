@@ -1,0 +1,698 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Mautic\EmailBundle\Tests\EventListener;
+
+use Mautic\EmailBundle\EventListener\MatchFilterForLeadTrait;
+use Mautic\LeadBundle\Entity\LeadListRepository;
+use Mautic\LeadBundle\Segment\OperatorOptions;
+use PHPUnit\Framework\TestCase;
+
+class MatchFilterForLeadTraitTest extends TestCase
+{
+    /**
+     * @var mixed[]
+     */
+    private array $lead = [
+        'id'     => 1,
+        'custom' => 'my custom text',
+    ];
+
+    /**
+     * @var mixed[]
+     */
+    private $filter = [
+        0 => [
+            'display' => null,
+            'field'   => 'custom',
+            'glue'    => 'and',
+            'object'  => 'lead',
+            'type'    => 'text',
+        ],
+    ];
+
+    private MatchFilterForLeadTraitTestable $matchFilterForLeadTrait;
+
+    protected function setUp(): void
+    {
+        $this->matchFilterForLeadTrait = new MatchFilterForLeadTraitTestable();
+
+        // Set required environment variable for FormFieldHelper
+        if (!isset($_ENV['MAUTIC_UPLOAD_DIR'])) {
+            $_ENV['MAUTIC_UPLOAD_DIR'] = '/tmp';
+        }
+    }
+
+    /**
+     * @param string|array<int, string> $filter
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('regionFilterDataProvider')]
+    public function testMatchFilterForLeadWithRegionFilter(string|array $filter, string $operator, bool $expected): void
+    {
+        $this->assertSame(
+            $expected,
+            $this->matchFilterForLeadTrait->match(
+                [
+                    [
+                        'glue'     => 'and',
+                        'type'     => 'region',
+                        'object'   => 'lead',
+                        'field'    => 'region',
+                        'operator' => $operator,
+                        'filter'   => $filter,
+                    ],
+                ],
+                [
+                    'id'     => 123,
+                    'region' => 'California',
+                ]
+            )
+        );
+    }
+
+    /**
+     * @return iterable<string, array{filter: string|string[], operator: string, expected: bool}>
+     */
+    public static function regionFilterDataProvider(): iterable
+    {
+        yield 'Region equals by state name is the same' => [
+            'filter'   => 'California',
+            'operator' => '=',
+            'expected' => true,
+        ];
+
+        yield 'Region equals by state ID is the same' => [
+            'filter'   => '4', // index starts at 0 for single select
+            'operator' => '=',
+            'expected' => true,
+        ];
+
+        yield 'Region equals by state name is NOT the same' => [
+            'filter'   => 'Texas',
+            'operator' => '=',
+            'expected' => false,
+        ];
+
+        yield 'Region equals by state ID is NOT the same' => [
+            'filter'   => '555',
+            'operator' => '=',
+            'expected' => false,
+        ];
+
+        yield 'Region including by state name is the same' => [
+            'filter'   => ['California'],
+            'operator' => 'in',
+            'expected' => true,
+        ];
+
+        yield 'Region including by state ID is the same' => [
+            'filter'   => ['5'], // index starts at 1 for muli-select
+            'operator' => 'in',
+            'expected' => true,
+        ];
+
+        yield 'Region including by state name is NOT the same' => [
+            'filter'   => ['Texas'],
+            'operator' => 'in',
+            'expected' => false,
+        ];
+
+        yield 'Region including by state ID is NOT the same' => [
+            'filter'   => ['555'],
+            'operator' => 'in',
+            'expected' => false,
+        ];
+    }
+
+    public function testDWCContactStartWidth(): void
+    {
+        $this->filter[0]['operator'] = 'startsWith';
+        $this->filter[0]['filter']   = 'my';
+
+        self::assertTrue($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+
+        $this->lead['custom'] = 'another text';
+
+        self::assertFalse($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+    }
+
+    public function testDWCContactWithRegex(): void
+    {
+        $this->lead['custom']        = '04249';
+        $this->filter[0]['operator'] = 'regexp';
+        $this->filter[0]['filter']   = '(13357|04249|20363)';
+
+        self::assertTrue($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+    }
+
+    public function testDWCContactEndWidth(): void
+    {
+        $this->filter[0]['operator'] = 'endsWith';
+        $this->filter[0]['filter']   = 'text';
+
+        self::assertTrue($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+
+        $this->lead['custom'] = 'another words';
+
+        self::assertFalse($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+    }
+
+    public function testDWCContactContains(): void
+    {
+        $this->filter[0]['operator'] = 'contains';
+        $this->filter[0]['filter']   = 'custom';
+
+        self::assertTrue($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+
+        $this->lead['custom'] = 'another words';
+
+        self::assertFalse($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+    }
+
+    public function testMatchFilterForLeadWithNumberType(): void
+    {
+        $this->lead['custom'] = '10.5';
+
+        $this->filter[0]['type']     = 'number';
+        $this->filter[0]['operator'] = OperatorOptions::EQUAL_TO;
+        $this->filter[0]['filter']   = '10.5';
+        $this->assertTrue($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+
+        $this->filter[0]['operator'] = OperatorOptions::GREATER_THAN_OR_EQUAL;
+        $this->filter[0]['filter']   = '5.5';
+        $this->filter                = [
+            1 => [
+                'display'  => null,
+                'field'    => 'custom',
+                'filter'   => '11.5',
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => OperatorOptions::LESS_THAN_OR_EQUAL,
+                'type'     => 'number',
+            ],
+        ];
+        $this->assertTrue($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+
+        $this->filter[0]['operator'] = OperatorOptions::LESS_THAN_OR_EQUAL;
+        $this->filter[0]['filter']   = '5.5';
+        $this->filter                = [
+            1 => [
+                'display'  => null,
+                'field'    => 'custom',
+                'filter'   => '11.5',
+                'glue'     => 'or',
+                'object'   => 'lead',
+                'operator' => OperatorOptions::GREATER_THAN_OR_EQUAL,
+                'type'     => 'number',
+            ],
+        ];
+        $this->assertFalse($this->matchFilterForLeadTrait->match($this->filter, $this->lead));
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('dateMatchTestProvider')]
+    public function testMatchFilterForLeadTraitForDate(?string $value, string $operator, bool $expect): void
+    {
+        $filters = [
+            [
+                'glue'     => 'and',
+                'field'    => 'date',
+                'object'   => 'lead',
+                'type'     => 'date',
+                'filter'   => '2021-05-01',
+                'display'  => null,
+                'operator' => $operator,
+            ],
+        ];
+
+        $lead = [
+            'id'   => 1,
+            'date' => $value,
+        ];
+
+        $this->assertEquals($expect, $this->matchFilterForLeadTrait->match($filters, $lead));
+    }
+
+    public static function dateMatchTestProvider(): iterable
+    {
+        $date = '2021-05-01';
+
+        yield [$date, '=', true];
+        yield [$date, '!=', false];
+        yield ['2020-02-02', '!=', true];
+        yield [$date, '!=', false];
+        yield [null, 'empty', true];
+        yield [$date, 'empty', false];
+        yield [$date, '!empty', true];
+        yield [null, '!empty', false];
+    }
+
+    /**
+     * @param array<string,string> $fieldDetails
+     * @param array<string,string> $filterDetails
+     */
+    #[\PHPUnit\Framework\Attributes\DataProvider('dataForInNotInOperatorFilter')]
+    public function testCheckLeadValueIsInFilter(array $fieldDetails, array $filterDetails, bool $expected): void
+    {
+        $lead = [
+            'id'                  => 1,
+            $fieldDetails['name'] => $fieldDetails['value'],
+        ];
+
+        $filter = [
+            0 => [
+                'display'  => null,
+                'field'    => $fieldDetails['name'],
+                'filter'   => $filterDetails['value'],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $filterDetails['operator'],
+                'type'     => $fieldDetails['type'],
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+
+        $this->assertSame($expected, $trait->match($filter, $lead));
+    }
+
+    /**
+     * @return iterable<string, string[]>
+     */
+    public static function segmentMembershipFilterProvider(): iterable
+    {
+        yield 'Classic Segment Membership Filter' => ['leadlist'];
+        yield 'Static Segment Membership Filter' => ['leadlist_static'];
+    }
+
+    #[\PHPUnit\Framework\Attributes\DataProvider('segmentMembershipFilterProvider')]
+    public function testIsContactSegmentRelationshipValidEmpty(string $filterField): void
+    {
+        $lead['id'] = 1;
+        $segmentId  = 1;
+        $operator   = OperatorOptions::EMPTY;
+
+        $segmentRepository = $this->createMock(LeadListRepository::class);
+        $segmentRepository->expects(self::once())
+            ->method('isNotContactInAnySegment')
+            ->with($lead['id'])
+            ->willReturn(true);
+
+        $filter = [
+            0 => [
+                'display' => 'Segment Membership',
+                'field'   => $filterField,
+                'filter'  => [
+                    0 => $segmentId,
+                ],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $operator,
+                'type'     => 'leadlist',
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+        $trait->setRepository($segmentRepository);
+
+        self::assertTrue($trait->match($filter, $lead));
+    }
+
+    /**
+     * @return mixed[]
+     */
+    public static function dataForInNotInOperatorFilter(): iterable
+    {
+        // field details, filter details, expected.
+        yield [
+            [
+                'name'  => 'field_select',
+                'type'  => 'select',
+                'value' => 'one',
+            ],
+            [
+                'operator'  => OperatorOptions::INCLUDING_ANY,
+                'value'     => 'one',
+            ],
+            true,
+        ];
+        yield [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two',
+            ],
+            [
+                'operator'  => OperatorOptions::EXCLUDING_ANY,
+                'value'     => 'three',
+            ],
+            true,
+        ];
+        yield [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two|three',
+            ],
+            [
+                'operator'  => OperatorOptions::EXCLUDING_ANY,
+                'value'     => 'one|four',
+            ],
+            false,
+        ];
+        yield [
+            [
+                'name'  => 'field_country',
+                'type'  => 'country',
+                'value' => 'Some country',
+            ],
+            [
+                'operator'  => OperatorOptions::INCLUDING_ANY,
+                'value'     => 'Some country',
+            ],
+            true,
+        ];
+        yield [
+            [
+                'name'  => 'field_country',
+                'type'  => 'country',
+                'value' => 'Some country',
+            ],
+            [
+                'operator'  => OperatorOptions::INCLUDING_ANY,
+                'value'     => 'Some other country',
+            ],
+            false,
+        ];
+        yield 'Excluding all, none of the values matched.' => [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two',
+            ],
+            [
+                'operator'  => OperatorOptions::EXCLUDING_ALL,
+                'value'     => 'three|four',
+            ],
+            true,
+        ];
+        yield 'Excluding all, some of the values matched.' => [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two|three',
+            ],
+            [
+                'operator'  => OperatorOptions::EXCLUDING_ALL,
+                'value'     => 'one|four',
+            ],
+            true,
+        ];
+        yield 'Excluding all, all of the values matched.' => [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two|three',
+            ],
+            [
+                'operator'  => OperatorOptions::EXCLUDING_ALL,
+                'value'     => 'one|three',
+            ],
+            false,
+        ];
+        yield 'Including all, none of the values matched.' => [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two',
+            ],
+            [
+                'operator'  => OperatorOptions::INCLUDING_ALL,
+                'value'     => 'three|four',
+            ],
+            false,
+        ];
+        yield 'Including all, some of the values matched.' => [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two|three',
+            ],
+            [
+                'operator'  => OperatorOptions::INCLUDING_ALL,
+                'value'     => 'one|four',
+            ],
+            false,
+        ];
+        yield 'Including all, all of the values matched.' => [
+            [
+                'name'  => 'field_multiselect',
+                'type'  => 'multiselect',
+                'value' => 'one|two|three',
+            ],
+            [
+                'operator'  => OperatorOptions::INCLUDING_ALL,
+                'value'     => 'one|three',
+            ],
+            true,
+        ];
+    }
+
+    public function testMatchFilterForLeadTraitEmptyCompany(): void
+    {
+        $lead = [
+            'id'        => 1,
+            'firstname' => 'Test',
+            'companies' => [],
+        ];
+
+        $filters = [
+            0 => [
+                'glue'      => 'and',
+                'field'     => 'companycity',
+                'object'    => 'company',
+                'type'      => 'text',
+                'filter'    => 'New York',
+                'display'   => null,
+                'operator'  => '=',
+            ],
+        ];
+
+        try {
+            $this->assertEquals(false, $this->matchFilterForLeadTrait->match($filters, $lead));
+        } catch (\Exception $e) {
+            $this->fail($e->getMessage());
+        }
+    }
+
+    public function testIsContactSegmentRelationshipValidNotEmpty(): void
+    {
+        $lead['id'] = 1;
+        $segmentId  = 1;
+        $operator   = OperatorOptions::NOT_EMPTY;
+
+        $segmentRepository = $this->createMock(LeadListRepository::class);
+        $segmentRepository->expects(self::once())
+            ->method('isContactInAnySegment')
+            ->with($lead['id'])
+            ->willReturn(true);
+
+        $filter = [
+            0 => [
+                'display' => 'Segment Membership',
+                'field'   => 'leadlist',
+                'filter'  => [
+                    0 => $segmentId,
+                ],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $operator,
+                'type'     => 'leadlist',
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+        $trait->setRepository($segmentRepository);
+
+        self::assertTrue($trait->match($filter, $lead));
+    }
+
+    public function testIsContactSegmentRelationshipValidIn(): void
+    {
+        $lead['id'] = 1;
+        $segmentId  = 1;
+        $operator   = OperatorOptions::INCLUDING_ANY;
+
+        $segmentRepository = $this->createMock(LeadListRepository::class);
+        $segmentRepository->expects(self::once())
+            ->method('isContactInSegments')
+            ->with($lead['id'], [0 => $segmentId, 1 => 2])
+            ->willReturn(true);
+
+        $filter = [
+            0 => [
+                'display' => 'Segment Membership',
+                'field'   => 'leadlist',
+                'filter'  => [
+                    0 => $segmentId,
+                    1 => 2,
+                ],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $operator,
+                'type'     => 'leadlist',
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+        $trait->setRepository($segmentRepository);
+
+        self::assertTrue($trait->match($filter, $lead));
+    }
+
+    public function testIsContactSegmentRelationshipValidNotIn(): void
+    {
+        $lead['id'] = 1;
+        $segmentId  = 1;
+        $operator   = OperatorOptions::EXCLUDING_ANY;
+
+        $segmentRepository = $this->createMock(LeadListRepository::class);
+        $segmentRepository->expects(self::once())
+            ->method('isNotContactInSegments')
+            ->with($lead['id'], [0 => $segmentId, 1 => 2])
+            ->willReturn(true);
+
+        $filter = [
+            0 => [
+                'display' => 'Segment Membership',
+                'field'   => 'leadlist',
+                'filter'  => [
+                    0 => $segmentId,
+                    1 => 2,
+                ],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $operator,
+                'type'     => 'leadlist',
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+        $trait->setRepository($segmentRepository);
+
+        self::assertTrue($trait->match($filter, $lead));
+    }
+
+    public function testIsContactSegmentRelationshipValidInAll(): void
+    {
+        $lead['id'] = 1;
+        $segmentId  = 1;
+        $operator   = OperatorOptions::INCLUDING_ALL;
+
+        $segmentRepository = $this->createMock(LeadListRepository::class);
+        $segmentRepository->expects(self::once())
+            ->method('isContactInAllSegments')
+            ->with($lead['id'], [0 => $segmentId, 1 => 2])
+            ->willReturn(true);
+
+        $filter = [
+            0 => [
+                'display' => 'Segment Membership',
+                'field'   => 'leadlist',
+                'filter'  => [
+                    0 => $segmentId,
+                    1 => 2,
+                ],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $operator,
+                'type'     => 'leadlist',
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+        $trait->setRepository($segmentRepository);
+
+        self::assertTrue($trait->match($filter, $lead));
+    }
+
+    public function testIsContactSegmentRelationshipValidNotInAll(): void
+    {
+        $lead['id'] = 1;
+        $segmentId  = 1;
+        $operator   = OperatorOptions::EXCLUDING_ALL;
+
+        $segmentRepository = $this->createMock(LeadListRepository::class);
+        $segmentRepository->expects(self::once())
+            ->method('isNotContactInAllSegments')
+            ->with($lead['id'], [0 => $segmentId, 1 => 2])
+            ->willReturn(true);
+
+        $filter = [
+            0 => [
+                'display' => 'Segment Membership',
+                'field'   => 'leadlist',
+                'filter'  => [
+                    0 => $segmentId,
+                    1 => 2,
+                ],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $operator,
+                'type'     => 'leadlist',
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+        $trait->setRepository($segmentRepository);
+
+        self::assertTrue($trait->match($filter, $lead));
+    }
+
+    public function testIsContactSegmentRelationshipValidInvalidOperator(): void
+    {
+        $lead['id'] = 1;
+        $segmentId  = 1;
+        $operator   = 'invalid';
+
+        $segmentRepository = $this->createMock(LeadListRepository::class);
+
+        $filter = [
+            0 => [
+                'display' => 'Segment Membership',
+                'field'   => 'leadlist',
+                'filter'  => [
+                    0 => $segmentId,
+                ],
+                'glue'     => 'and',
+                'object'   => 'lead',
+                'operator' => $operator,
+                'type'     => 'leadlist',
+            ],
+        ];
+
+        $trait = new MatchFilterForLeadTraitTestable();
+        $trait->setRepository($segmentRepository);
+
+        $this->expectException(\InvalidArgumentException::class);
+
+        $trait->match($filter, $lead);
+    }
+}
+
+class MatchFilterForLeadTraitTestable
+{
+    use MatchFilterForLeadTrait;
+
+    private LeadListRepository $segmentRepository;
+
+    public function setRepository(LeadListRepository $segmentRepository): void
+    {
+        $this->segmentRepository = $segmentRepository;
+    }
+
+    public function match(array $filter, array $lead): bool
+    {
+        return $this->matchFilterForLead($filter, $lead);
+    }
+}

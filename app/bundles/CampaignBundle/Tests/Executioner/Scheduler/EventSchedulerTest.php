@@ -1,0 +1,404 @@
+<?php
+
+namespace Mautic\CampaignBundle\Tests\Executioner\Scheduler;
+
+use Doctrine\Common\Collections\ArrayCollection;
+use Mautic\CampaignBundle\CampaignEvents;
+use Mautic\CampaignBundle\Entity\Campaign;
+use Mautic\CampaignBundle\Entity\Event;
+use Mautic\CampaignBundle\Entity\LeadEventLog;
+use Mautic\CampaignBundle\Event\ScheduledBatchEvent;
+use Mautic\CampaignBundle\EventCollector\Accessor\Event\ActionAccessor;
+use Mautic\CampaignBundle\EventCollector\EventCollector;
+use Mautic\CampaignBundle\Executioner\Logger\EventLogger;
+use Mautic\CampaignBundle\Executioner\Scheduler\EventScheduler;
+use Mautic\CampaignBundle\Executioner\Scheduler\Mode\DateTime;
+use Mautic\CampaignBundle\Executioner\Scheduler\Mode\Interval;
+use Mautic\CampaignBundle\Executioner\Scheduler\Mode\Optimized;
+use Mautic\CampaignBundle\Service\PublishStateService;
+use Mautic\CoreBundle\Helper\CoreParametersHelper;
+use Mautic\CoreBundle\Service\OptimisticLockServiceInterface;
+use Mautic\LeadBundle\Entity\Lead;
+use Mautic\LeadBundle\Services\PeakInteractionTimer;
+use PHPUnit\Framework\Assert;
+use PHPUnit\Framework\MockObject\MockObject;
+use Psr\Log\NullLogger;
+use Symfony\Component\EventDispatcher\EventDispatcherInterface;
+
+class EventSchedulerTest extends \PHPUnit\Framework\TestCase
+{
+    private NullLogger $logger;
+
+    /**
+     * @var EventLogger|MockObject
+     */
+    private MockObject $eventLogger;
+
+    private Interval $intervalScheduler;
+
+    private DateTime $dateTimeScheduler;
+
+    private Optimized $optimizedScheduler;
+
+    /**
+     * @var EventCollector|MockObject
+     */
+    private MockObject $eventCollector;
+
+    /**
+     * @var EventDispatcherInterface|MockObject
+     */
+    private MockObject $dispatcher;
+
+    /**
+     * @var CoreParametersHelper|MockObject
+     */
+    private MockObject $coreParamtersHelper;
+
+    /**
+     * @var PeakInteractionTimer|MockObject
+     */
+    private MockObject $peakInteractionTimer;
+
+    private EventScheduler $scheduler;
+
+    /**
+     * @var MockObject&PublishStateService
+     */
+    private MockObject $publishStateService;
+
+    protected function setUp(): void
+    {
+        $this->logger              = new NullLogger();
+        $this->coreParamtersHelper = $this->createMock(CoreParametersHelper::class);
+        $this->coreParamtersHelper->method('getDefaultTimezone')
+            ->willReturn('America/New_York');
+        $this->eventLogger                = $this->createMock(EventLogger::class);
+        $this->peakInteractionTimer       = $this->createMock(PeakInteractionTimer::class);
+        $this->intervalScheduler          = new Interval($this->logger, $this->coreParamtersHelper);
+        $this->dateTimeScheduler          = new DateTime($this->logger);
+        $this->optimizedScheduler         = new Optimized($this->peakInteractionTimer);
+        $this->eventCollector             = $this->createMock(EventCollector::class);
+        $this->dispatcher                 = $this->createMock(EventDispatcherInterface::class);
+        $this->publishStateService        = $this->createMock(PublishStateService::class);
+        $this->scheduler                  = new EventScheduler(
+            $this->logger,
+            $this->eventLogger,
+            $this->intervalScheduler,
+            $this->dateTimeScheduler,
+            $this->optimizedScheduler,
+            $this->eventCollector,
+            $this->dispatcher,
+            $this->coreParamtersHelper,
+            $this->createMock(OptimisticLockServiceInterface::class),
+            $this->publishStateService
+        );
+    }
+
+    public function testShouldScheduleIgnoresSeconds(): void
+    {
+        $this->assertFalse(
+            $this->scheduler->shouldSchedule(
+                new \DateTime('2018-07-03 09:20:45'),
+                new \DateTime('2018-07-03 09:20:30')
+            )
+        );
+    }
+
+    public function testShouldSchedule(): void
+    {
+        $this->assertTrue(
+            $this->scheduler->shouldSchedule(
+                new \DateTime('2018-07-03 09:21:45'),
+                new \DateTime('2018-07-03 09:20:30')
+            )
+        );
+    }
+
+    public function testShouldScheduleForInactive(): void
+    {
+        $date  = new \DateTime();
+        $now   = clone $date;
+        $event = new Event();
+        $event->setTriggerIntervalUnit('d');
+        $event->setTriggerMode(Event::TRIGGER_MODE_INTERVAL);
+
+        $this->assertFalse($this->scheduler->shouldScheduleEvent($event, $date, $now));
+
+        $event->setTriggerRestrictedDaysOfWeek([]);
+
+        $this->assertFalse($this->scheduler->shouldScheduleEvent($event, $date, $now));
+
+        $event->setTriggerRestrictedStartHour('23:00');
+        $event->setTriggerRestrictedStopHour('23:30');
+
+        $this->assertTrue($this->scheduler->shouldScheduleEvent($event, $date, $now));
+
+        $date->add(new \DateInterval('P2D'));
+        $event = new Event();
+        $this->assertTrue($this->scheduler->shouldScheduleEvent($event, $date, $now));
+    }
+
+    public function testGetExecutionDateForInactivity(): void
+    {
+        $date = new \DateTime();
+        $now  = clone $date;
+        $now->add(new \DateInterval('P2D'));
+
+        $clonedNow = $this->scheduler->getExecutionDateForInactivity($date, $date, $now);
+        $this->assertNotSame($now, $clonedNow);
+        $this->assertSame($now->getTimestamp(), $clonedNow->getTimestamp());
+
+        $secondDate = clone $date;
+        $secondDate->add(new \DateInterval('P1D'));
+
+        $resultDate = $this->scheduler->getExecutionDateForInactivity($date, $secondDate, $now);
+        $this->assertSame($date, $resultDate);
+    }
+
+    public function testEventDoesNotGetRescheduledForRelativeTimeWhenValidated(): void
+    {
+        $campaign = $this->createMock(Campaign::class);
+        $campaign->method('getId')
+            ->willReturn(1);
+
+        $event = $this->createMock(Event::class);
+        $event->method('getTriggerMode')
+            ->willReturn(Event::TRIGGER_MODE_INTERVAL);
+        $event->method('getTriggerInterval')
+            ->willReturn(1);
+        $event->method('getTriggerIntervalUnit')
+            ->willReturn('d');
+        $event->method('getTriggerHour')
+            ->willReturn(
+                new \DateTime('1970-01-01 09:00:00')
+            );
+        $event->method('getTriggerRestrictedDaysOfWeek')
+            ->willReturn([]);
+        $event->method('getCampaign')
+            ->willReturn($campaign);
+        $event->method('getId')
+            ->willReturn(1);
+
+        // The campaign executed with + 1 day at 1pm ET
+        $logDateTriggered = new \DateTime('2018-08-30 17:00:00', new \DateTimeZone('America/New_York'));
+
+        // The log was scheduled to be executed at 9am
+        $logTriggerDate = new \DateTime('2018-08-31 13:00:00', new \DateTimeZone('America/New_York'));
+
+        // Simulate now with a few seconds past trigger date because in reality it won't be exact
+        $simulatedNow = new \DateTime('2018-08-31 13:00:15', new \DateTimeZone('America/New_York'));
+
+        $contact = $this->createMock(Lead::class);
+        $contact->method('getId')
+            ->willReturn(1);
+        $contact->method('getTimezone')
+            ->willReturn('America/New_York');
+
+        $log = $this->createMock(LeadEventLog::class);
+        $log->method('getTriggerDate')
+            ->willReturn($logTriggerDate);
+        $log->method('getDateTriggered')
+            ->willReturn($logDateTriggered);
+        $log->method('getLead')
+            ->willReturn($contact);
+        $log->method('getEvent')
+            ->willReturn($event);
+
+        $executionDate = $this->scheduler->validateExecutionDateTime($log, $simulatedNow);
+        $this->assertTrue($this->scheduler->shouldSchedule($executionDate, $simulatedNow));
+        $this->assertEquals('2018-08-31 17:00:00', $executionDate->format('Y-m-d H:i:s'));
+        $this->assertEquals('America/New_York', $executionDate->getTimezone()->getName());
+    }
+
+    public function testEventIsRescheduledForRelativeTimeIfAppropriate(): void
+    {
+        $campaign = $this->createMock(Campaign::class);
+        $campaign->method('getId')
+            ->willReturn(1);
+
+        $event = $this->createMock(Event::class);
+        $event->method('getTriggerMode')
+            ->willReturn(Event::TRIGGER_MODE_INTERVAL);
+        $event->method('getTriggerInterval')
+            ->willReturn(1);
+        $event->method('getTriggerIntervalUnit')
+            ->willReturn('d');
+        $event->method('getTriggerHour')
+            ->willReturn(
+                new \DateTime('1970-01-01 11:00:00')
+            );
+        $event->method('getTriggerRestrictedDaysOfWeek')
+            ->willReturn([]);
+        $event->method('getCampaign')
+            ->willReturn($campaign);
+        $event->method('getId')
+            ->willReturn(1);
+
+        // The campaign executed with + 1 day at 1pm ET
+        $logDateTriggered = new \DateTime('2018-08-30 17:00:00');
+
+        // The log was scheduled to be executed at 9am
+        $logTriggerDate = new \DateTime('2018-08-31 13:00:00');
+
+        // Simulate now with a few seconds past trigger date because in reality it won't be exact
+        $simulatedNow = new \DateTime('2018-08-31 13:00:15');
+
+        $contact = $this->createMock(Lead::class);
+        $contact->method('getId')
+            ->willReturn(1);
+        $contact->method('getTimezone')
+            ->willReturn('America/New_York');
+
+        $log = $this->createMock(LeadEventLog::class);
+        $log->method('getTriggerDate')
+            ->willReturn($logTriggerDate);
+        $log->method('getDateTriggered')
+            ->willReturn($logDateTriggered);
+        $log->method('getLead')
+            ->willReturn($contact);
+        $log->method('getEvent')
+            ->willReturn($event);
+
+        $executionDate = $this->scheduler->validateExecutionDateTime($log, $simulatedNow);
+        $this->assertTrue($this->scheduler->shouldSchedule($executionDate, $simulatedNow));
+        // It is OK to set the execution date 15 seconds in the past. It means execute right now.
+        $this->assertEquals('2018-08-31 13:00:00', $executionDate->format('Y-m-d H:i:s'));
+        $this->assertEquals('America/New_York', $executionDate->getTimezone()->getName());
+    }
+
+    public function testEventDoesNotGetRescheduledForRelativeTimeWithDowWhenValidated(): void
+    {
+        $campaign = $this->createMock(Campaign::class);
+        $campaign->method('getId')
+            ->willReturn(1);
+
+        // The campaign executed with + 1 day at 1pm ET
+        $logDateTriggered = new \DateTime('2018-08-30 17:00:00', new \DateTimeZone('America/New_York'));
+
+        // The log was scheduled to be executed at 9am
+        $logTriggerDate = new \DateTime('2018-08-31 13:00:00', new \DateTimeZone('America/New_York'));
+
+        // Simulate now with a few seconds past trigger date because in reality it won't be exact
+        $simulatedNow = new \DateTime('2018-08-31 13:00:15', new \DateTimeZone('America/New_York'));
+
+        $dow = $simulatedNow->format('w');
+
+        $event = $this->createMock(Event::class);
+        $event->method('getTriggerMode')
+            ->willReturn(Event::TRIGGER_MODE_INTERVAL);
+        $event->method('getTriggerRestrictedStartHour')
+            ->willReturn(new \DateTime('1970-01-01 10:00:00'));
+        $event->method('getTriggerRestrictedStopHour')
+            ->willReturn(new \DateTime('1970-01-01 20:00:00'));
+        $event->method('getTriggerRestrictedDaysOfWeek')
+            ->willReturn([$dow]);
+        $event->method('getCampaign')
+            ->willReturn($campaign);
+        $event->method('getTriggerIntervalUnit')
+            ->willReturn('d');
+        $event->method('getId')
+            ->willReturn(1);
+
+        $contact = $this->createMock(Lead::class);
+        $contact->method('getId')
+            ->willReturn(1);
+        $contact->method('getTimezone')
+            ->willReturn('America/New_York');
+
+        $log = $this->createMock(LeadEventLog::class);
+        $log->method('getTriggerDate')
+            ->willReturn($logTriggerDate);
+        $log->method('getDateTriggered')
+            ->willReturn($logDateTriggered);
+        $log->method('getLead')
+            ->willReturn($contact);
+        $log->method('getEvent')
+            ->willReturn($event);
+
+        $executionDate = $this->scheduler->validateExecutionDateTime($log, $simulatedNow);
+
+        $this->assertFalse($this->scheduler->shouldSchedule($executionDate, $simulatedNow));
+        $this->assertEquals('2018-08-31 13:00:15', $executionDate->format('Y-m-d H:i:s'));
+        $this->assertEquals('America/New_York', $executionDate->getTimezone()->getName());
+    }
+
+    public function testRescheduleFailuresWithRescheduleDateSet(): void
+    {
+        $logWithRescheduleInterval   = new LeadEventLog();
+        $logWithNoRescheduleInterval = new LeadEventLog();
+        $event                       = new Event();
+        $campaign                    = new Campaign();
+        $contact                     = new Lead();
+        $now                         = new \DateTimeImmutable('now');
+
+        /** @var MockObject|CoreParametersHelper */
+        $coreParamtersHelper = $this->createMock(CoreParametersHelper::class);
+
+        $event->setCampaign($campaign);
+
+        $logWithRescheduleInterval->setRescheduleInterval(new \DateInterval('PT10M'));
+        $logWithRescheduleInterval->setEvent($event);
+        $logWithRescheduleInterval->setLead($contact);
+
+        $logWithNoRescheduleInterval->setEvent($event);
+        $logWithNoRescheduleInterval->setLead($contact);
+
+        $this->eventCollector->method('getEventConfig')
+            ->willReturn(new ActionAccessor([]));
+
+        $coreParamtersHelper->expects($this->once())
+            ->method('get')
+            ->with('campaign_time_wait_on_event_false')
+            ->willReturn('PT1H');
+        $matcher = $this->exactly(3);
+
+        $this->dispatcher->expects($matcher)
+            ->method('dispatch')->willReturnCallback(function (...$parameters) use ($matcher, $now) {
+                if (1 === $matcher->numberOfInvocations()) {
+                    $callback = function (ScheduledBatchEvent $event) use ($now) {
+                        // The first log was scheduled to 10 minutes.
+                        Assert::assertCount(1, $event->getScheduled());
+                        Assert::assertGreaterThan($now->modify('+9 minutes'), $event->getScheduled()->first()->getTriggerDate());
+                        Assert::assertLessThan($now->modify('+11 minutes'), $event->getScheduled()->first()->getTriggerDate());
+                    };
+                    $callback($parameters[0]);
+                    $this->assertSame(CampaignEvents::ON_EVENT_SCHEDULED_BATCH, $parameters[1]);
+                }
+                if (2 === $matcher->numberOfInvocations()) {
+                    $callback = function (ScheduledBatchEvent $event) use ($now) {
+                        // The second log was not scheduled so the default interval is used.
+                        Assert::assertCount(1, $event->getScheduled());
+                        Assert::assertGreaterThan($now->modify('+59 minutes'), $event->getScheduled()->first()->getTriggerDate());
+                        Assert::assertLessThan($now->modify('+61 minutes'), $event->getScheduled()->first()->getTriggerDate());
+                    };
+                    $callback($parameters[0]);
+                    $this->assertSame(CampaignEvents::ON_EVENT_SCHEDULED_BATCH, $parameters[1]);
+                }
+                if (3 === $matcher->numberOfInvocations()) {
+                    $callback = function (ScheduledBatchEvent $event) {
+                        Assert::assertCount(2, $event->getScheduled());
+                    };
+                    $callback($parameters[0]);
+                    $this->assertSame(CampaignEvents::ON_EVENT_SCHEDULED_BATCH, $parameters[1]);
+                }
+
+                return $parameters[0];
+            });
+
+        $scheduler         = new EventScheduler(
+            $this->logger,
+            $this->eventLogger,
+            $this->intervalScheduler,
+            $this->dateTimeScheduler,
+            $this->optimizedScheduler,
+            $this->eventCollector,
+            $this->dispatcher,
+            $coreParamtersHelper,
+            $this->createMock(OptimisticLockServiceInterface::class),
+            $this->publishStateService
+        );
+
+        $scheduler->rescheduleFailures(new ArrayCollection([$logWithRescheduleInterval, $logWithNoRescheduleInterval]));
+    }
+}
