@@ -9,6 +9,9 @@ use ApiPlatform\Metadata\GetCollection;
 use ApiPlatform\Metadata\Patch;
 use ApiPlatform\Metadata\Post;
 use ApiPlatform\Metadata\Put;
+use ApiPlatform\OpenApi\Model\Operation as OpenApiOperation;
+use ApiPlatform\OpenApi\Model\RequestBody as OpenApiRequestBody;
+use ApiPlatform\OpenApi\Model\Response as OpenApiResponse;
 use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\Common\Collections\Collection;
 use Doctrine\Common\Collections\Criteria;
@@ -41,6 +44,143 @@ use Symfony\Component\Validator\Mapping\ClassMetadata;
         new Put(security: "is_granted('campaign:campaigns:editown', object)"),
         new Patch(security: "is_granted('campaign:campaigns:editother', object)"),
         new Delete(security: "is_granted('campaign:campaigns:deleteown', object)"),
+
+        // Agent-friendly campaign canvas operations (MCP support)
+        new Get(
+            uriTemplate: '/campaigns/events/types',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::getEventTypesAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:viewown')",
+            name: 'campaign_event_types',
+            openapi: new OpenApiOperation(
+                summary: 'List available campaign event types',
+                description: 'Returns all actions, conditions, and decisions available for campaign automation. Agents use this to discover valid event types, their properties, and connection restrictions.',
+                responses: [
+                    '200' => new OpenApiResponse(description: 'Event types grouped by category (actions, conditions, decisions)'),
+                ]
+            ),
+        ),
+        new Post(
+            uriTemplate: '/campaigns/{id}/events',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::newEventAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:editown')",
+            name: 'campaign_new_event',
+            openapi: new OpenApiOperation(
+                summary: 'Create a campaign event',
+                description: 'Adds a new event to a campaign. The event is automatically added to the canvas with a generated temporary ID that gets replaced on save. Returns the created event with its real ID.',
+                requestBody: new OpenApiRequestBody(
+                    description: 'Event data (name, type, eventType, properties, triggerMode, etc.)'
+                ),
+                responses: [
+                    '201' => new OpenApiResponse(description: 'Event created with real ID'),
+                    '404' => new OpenApiResponse(description: 'Campaign not found'),
+                ]
+            ),
+        ),
+        new Put(
+            uriTemplate: '/campaigns/events/{eventId}',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::editEventAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:editown')",
+            name: 'campaign_edit_event',
+            openapi: new OpenApiOperation(
+                summary: 'Update a campaign event',
+                description: 'Updates event properties (name, description, trigger settings, etc.). Does not change canvas position or connections.',
+                requestBody: new OpenApiRequestBody(description: 'Event properties to update'),
+                responses: [
+                    '200' => new OpenApiResponse(description: 'Event updated'),
+                    '404' => new OpenApiResponse(description: 'Event not found'),
+                ]
+            ),
+        ),
+        new Delete(
+            uriTemplate: '/campaigns/events/{eventId}',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::deleteEventAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:editown')",
+            name: 'campaign_delete_event',
+            openapi: new OpenApiOperation(
+                summary: 'Delete a campaign event',
+                description: 'Removes an event from the campaign, including its canvas node and all connections. Optionally redirects contacts to another event.',
+                requestBody: new OpenApiRequestBody(description: 'Optional: {"redirectEventId": 123}'),
+                responses: [
+                    '200' => new OpenApiResponse(description: 'Event deleted'),
+                    '404' => new OpenApiResponse(description: 'Event not found'),
+                ]
+            ),
+        ),
+        new Post(
+            uriTemplate: '/campaigns/{id}/connections',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::addConnectionAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:editown')",
+            name: 'campaign_add_connection',
+            openapi: new OpenApiOperation(
+                summary: 'Add a canvas connection between events',
+                description: 'Creates a directional connection between two events in the campaign canvas. Sets the parent/child relationship for execution flow.',
+                requestBody: new OpenApiRequestBody(description: '{"sourceId": 1, "targetId": 2, "anchorSource": "yes", "anchorTarget": "top"}'),
+                responses: [
+                    '201' => new OpenApiResponse(description: 'Connection created'),
+                    '404' => new OpenApiResponse(description: 'Campaign not found'),
+                ]
+            ),
+        ),
+        new Delete(
+            uriTemplate: '/campaigns/{id}/connections',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::removeConnectionAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:editown')",
+            name: 'campaign_remove_connection',
+            openapi: new OpenApiOperation(
+                summary: 'Remove a canvas connection',
+                description: 'Removes a directional connection between two events, eliminating their parent/child execution relationship.',
+                requestBody: new OpenApiRequestBody(description: '{"sourceId": 1, "targetId": 2}'),
+                responses: [
+                    '200' => new OpenApiResponse(description: 'Connection removed'),
+                    '404' => new OpenApiResponse(description: 'Campaign not found'),
+                ]
+            ),
+        ),
+        new Get(
+            uriTemplate: '/campaigns/{id}/canvas',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::getCanvasAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:viewown')",
+            name: 'campaign_get_canvas',
+            openapi: new OpenApiOperation(
+                summary: 'Get campaign canvas layout',
+                description: 'Returns the full canvas layout including all nodes (with positions) and connections for the campaign.',
+                responses: [
+                    '200' => new OpenApiResponse(description: 'Canvas layout with nodes and connections'),
+                    '404' => new OpenApiResponse(description: 'Campaign not found'),
+                ]
+            ),
+        ),
+        new Put(
+            uriTemplate: '/campaigns/{id}/canvas',
+            controller: 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::updateCanvasAction',
+            read: false,
+            deserialize: false,
+            security: "is_granted('campaign:campaigns:editown')",
+            name: 'campaign_update_canvas',
+            openapi: new OpenApiOperation(
+                summary: 'Replace the entire canvas layout',
+                description: 'Replaces all nodes and connections in the campaign canvas. Use connect_events/disconnect_events for granular changes.',
+                requestBody: new OpenApiRequestBody(description: '{"nodes": [...], "connections": [...]}'),
+                responses: [
+                    '200' => new OpenApiResponse(description: 'Canvas updated'),
+                    '404' => new OpenApiResponse(description: 'Campaign not found'),
+                ]
+            ),
+        ),
     ],
     normalizationContext: [
         'groups'                  => ['campaign:read'],
