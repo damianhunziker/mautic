@@ -126,6 +126,46 @@ return [
                 'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignApiController::importCampaignAction',
                 'method'     => 'POST',
             ],
+
+            // Granular campaign canvas API (agent-friendly MCP support)
+            'mautic_api_campaign_event_types' => [
+                'path'       => '/campaigns/events/types',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::getEventTypesAction',
+            ],
+            'mautic_api_campaign_new_event' => [
+                'path'       => '/campaigns/{id}/events',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::newEventAction',
+                'method'     => 'POST',
+            ],
+            'mautic_api_campaign_edit_event' => [
+                'path'       => '/campaigns/events/{eventId}',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::editEventAction',
+                'method'     => 'PUT',
+            ],
+            'mautic_api_campaign_delete_event' => [
+                'path'       => '/campaigns/events/{eventId}',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::deleteEventAction',
+                'method'     => 'DELETE',
+            ],
+            'mautic_api_campaign_add_connection' => [
+                'path'       => '/campaigns/{id}/connections',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::addConnectionAction',
+                'method'     => 'POST',
+            ],
+            'mautic_api_campaign_remove_connection' => [
+                'path'       => '/campaigns/{id}/connections',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::removeConnectionAction',
+                'method'     => 'DELETE',
+            ],
+            'mautic_api_campaign_get_canvas' => [
+                'path'       => '/campaigns/{id}/canvas',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::getCanvasAction',
+            ],
+            'mautic_api_campaign_update_canvas' => [
+                'path'       => '/campaigns/{id}/canvas',
+                'controller' => 'Mautic\CampaignBundle\Controller\Api\CampaignCanvasApiController::updateCanvasAction',
+                'method'     => 'PUT',
+            ],
         ],
     ],
 
