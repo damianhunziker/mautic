@@ -48,6 +48,10 @@ $firewalls = [
         ],
         'lazy' => true,
     ],
+    'v2api_docs' => [
+        'pattern'  => '^/api/v2/docs',
+        'security' => false,
+    ],
     'v2api' => [
         'pattern'            => '^/api/v2',
         'fos_oauth'          => true,
@@ -149,6 +153,8 @@ $container->loadFromExtension(
             ['path' => '^/s/saml/login$', 'roles' => AuthenticatedVoter::PUBLIC_ACCESS],
             ['path' => '^/saml/discovery$', 'roles' => AuthenticatedVoter::PUBLIC_ACCESS],
             ['path' => '^/oauth/v2/authorize', 'roles' => AuthenticatedVoter::PUBLIC_ACCESS],
+            // Allow public access to API docs/Swagger UI
+            ['path' => '^/api/v2/docs', 'roles' => AuthenticatedVoter::PUBLIC_ACCESS],
             // Second should be URIs that are defined as non-public.
             ['path' => '^/api', 'roles' => AuthenticatedVoter::IS_AUTHENTICATED_FULLY],
             ['path' => '^/(s/|elfinder|efconnect)', 'roles' => AuthenticatedVoter::IS_AUTHENTICATED],
