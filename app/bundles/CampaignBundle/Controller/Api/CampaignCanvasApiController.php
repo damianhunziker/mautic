@@ -97,34 +97,41 @@ class CampaignCanvasApiController extends CommonApiController
 
         $parameters = $this->getRequestParameters($request);
 
+        // Block empty properties
+        if (array_key_exists('properties', $parameters) && is_array($parameters['properties']) && empty($parameters['properties'])) {
+            $view = $this->view(['error' => 'properties cannot be empty'], Response::HTTP_BAD_REQUEST);
+
+            return $this->handleView($view);
+        }
+
         $tempId = 'new_'.bin2hex(random_bytes(8));
 
-        $sessionEvents = $this->buildCurrentEventsArray($campaign);
+        $sessionEvents  = $this->buildCurrentEventsArray($campaign);
         $canvasSettings = $this->getCurrentCanvasSettings($campaign);
 
         $eventData = [
-            'id'              => $tempId,
-            'name'            => $parameters['name'] ?? '',
-            'type'            => $parameters['type'] ?? '',
-            'eventType'       => $parameters['eventType'] ?? Event::TYPE_ACTION,
-            'order'           => $parameters['order'] ?? (count($sessionEvents) + 1),
-            'properties'      => $parameters['properties'] ?? [],
-            'triggerMode'     => $parameters['triggerMode'] ?? Event::TRIGGER_MODE_IMMEDIATE,
-            'triggerInterval' => $parameters['triggerInterval'] ?? 0,
-            'triggerIntervalUnit' => $parameters['triggerIntervalUnit'] ?? null,
-            'triggerDate'     => $parameters['triggerDate'] ?? null,
-            'triggerHour'     => $parameters['triggerHour'] ?? null,
-            'triggerRestrictedStartHour' => $parameters['triggerRestrictedStartHour'] ?? null,
-            'triggerRestrictedStopHour' => $parameters['triggerRestrictedStopHour'] ?? null,
+            'id'                          => $tempId,
+            'name'                        => $parameters['name'] ?? '',
+            'type'                        => $parameters['type'] ?? '',
+            'eventType'                   => $parameters['eventType'] ?? Event::TYPE_ACTION,
+            'order'                       => $parameters['order'] ?? (count($sessionEvents) + 1),
+            'properties'                  => $parameters['properties'] ?? [],
+            'triggerMode'                 => $parameters['triggerMode'] ?? Event::TRIGGER_MODE_IMMEDIATE,
+            'triggerInterval'             => $parameters['triggerInterval'] ?? 0,
+            'triggerIntervalUnit'         => $parameters['triggerIntervalUnit'] ?? null,
+            'triggerDate'                 => $parameters['triggerDate'] ?? null,
+            'triggerHour'                 => $parameters['triggerHour'] ?? null,
+            'triggerRestrictedStartHour'  => $parameters['triggerRestrictedStartHour'] ?? null,
+            'triggerRestrictedStopHour'   => $parameters['triggerRestrictedStopHour'] ?? null,
             'triggerRestrictedDaysOfWeek' => $parameters['triggerRestrictedDaysOfWeek'] ?? [],
-            'triggerWindow'   => $parameters['triggerWindow'] ?? null,
-            'description'     => $parameters['description'] ?? '',
-            'decisionPath'    => null,
-            'tempId'          => $tempId,
-            'children'        => [],
-            'parent'          => null,
-            'channel'         => $parameters['channel'] ?? null,
-            'channelId'       => $parameters['channelId'] ?? null,
+            'triggerWindow'               => $parameters['triggerWindow'] ?? null,
+            'description'                 => $parameters['description'] ?? '',
+            'decisionPath'                => null,
+            'tempId'                      => $tempId,
+            'children'                    => [],
+            'parent'                      => null,
+            'channel'                     => $parameters['channel'] ?? null,
+            'channelId'                   => $parameters['channelId'] ?? null,
         ];
 
         $sessionEvents[$tempId] = $eventData;
@@ -173,12 +180,19 @@ class CampaignCanvasApiController extends CommonApiController
 
         $parameters = $this->getRequestParameters($request);
 
+        // Block empty properties
+        if (array_key_exists('properties', $parameters) && is_array($parameters['properties']) && empty($parameters['properties'])) {
+            $view = $this->view(['error' => 'properties cannot be empty'], Response::HTTP_BAD_REQUEST);
+
+            return $this->handleView($view);
+        }
+
         $updatableFields = [
             'name', 'description', 'type', 'eventType', 'order',
             'properties', 'triggerMode', 'triggerInterval', 'triggerIntervalUnit',
             'triggerDate', 'triggerHour', 'triggerRestrictedStartHour',
             'triggerRestrictedStopHour', 'triggerRestrictedDaysOfWeek',
-            'triggerWindow', 'channel', 'channelId',
+            'triggerWindow', 'channel', 'channelId', 'decisionPath',
         ];
 
         foreach ($updatableFields as $field) {
@@ -188,6 +202,95 @@ class CampaignCanvasApiController extends CommonApiController
                     $event->$setter($parameters[$field]);
                 }
             }
+        }
+
+        // Handle parentId: set or remove parent relationship
+        if (array_key_exists('parentId', $parameters)) {
+            $parentId        = $parameters['parentId'];
+            $currentParent   = $event->getParent();
+            $currentParentId = $currentParent ? $currentParent->getId() : null;
+
+            if (null === $parentId || '' === $parentId || 0 === $parentId) {
+                // Remove parent — always allowed
+                if ($currentParent) {
+                    $currentParent->removeChild($event);
+                    $event->removeParent();
+                }
+            } else {
+                $newParentId = (int) $parentId;
+
+                // Block if this event already has a different parent
+                if (null !== $currentParentId && $currentParentId !== $newParentId) {
+                    $view = $this->view(
+                        ['error' => 'Event already has a parent ('.$currentParentId.'). Remove it first with parentId: null or via DELETE /campaigns/{campaignId}/connections.'],
+                        Response::HTTP_CONFLICT
+                    );
+
+                    return $this->handleView($view);
+                }
+
+                // Set new parent
+                $parentEvent = $this->eventModel->getEntity($newParentId);
+                if (null === $parentEvent || $parentEvent->isDeleted()) {
+                    $view = $this->view(['error' => 'parentId event not found'], Response::HTTP_BAD_REQUEST);
+
+                    return $this->handleView($view);
+                }
+                if ($parentEvent->getCampaign()->getId() !== $campaign->getId()) {
+                    $view = $this->view(['error' => 'parent event must belong to the same campaign'], Response::HTTP_BAD_REQUEST);
+
+                    return $this->handleView($view);
+                }
+
+                if ($currentParent) {
+                    $currentParent->removeChild($event);
+                }
+                $event->setParent($parentEvent);
+                $parentEvent->addChild($event);
+            }
+
+            // Sync canvasSettings with the new parent relationship
+            $canvasSettings = $this->getCurrentCanvasSettings($campaign);
+            $eventIdStr     = (string) $event->getId();
+
+            // Remove all connections targeting this event
+            $canvasSettings['connections'] = array_values(
+                array_filter(
+                    $canvasSettings['connections'] ?? [],
+                    fn ($conn) => (string) ($conn['targetId'] ?? '') !== $eventIdStr
+                )
+            );
+
+            // Add new connection if parent is set
+            $newParent = $event->getParent();
+            if ($newParent) {
+                // Determine correct anchor: decisions use yes/no, actions use bottom
+                $parentEventType = $newParent->getEventType();
+                if (in_array($parentEventType, ['decision', 'condition'], true)) {
+                    $defaultAnchor = 'yes';
+                } else {
+                    $defaultAnchor = 'bottom';
+                }
+                $canvasSettings['connections'][] = [
+                    'sourceId' => (string) $newParent->getId(),
+                    'targetId' => $eventIdStr,
+                    'anchors'  => [
+                        'source' => $event->getDecisionPath() ?? $defaultAnchor,
+                        'target' => 'top',
+                    ],
+                ];
+            }
+
+            // Rebuild events from canvas to keep DB parent/children in sync
+            $sessionEvents = $this->buildCurrentEventsArray($campaign);
+            $this->campaignModel->setEvents($campaign, $sessionEvents, $canvasSettings, []);
+            $this->campaignModel->saveEntity($campaign);
+            $this->campaignModel->setCanvasSettings($campaign, $canvasSettings);
+
+            $view = $this->view(['event' => $event], Response::HTTP_OK);
+            $this->setSerializationContext($view);
+
+            return $this->handleView($view);
         }
 
         $this->eventModel->getRepository()->saveEntity($event);
@@ -212,7 +315,7 @@ class CampaignCanvasApiController extends CommonApiController
 
         $parameters = $this->getRequestParameters($request);
 
-        $sessionEvents = $this->buildCurrentEventsArray($campaign);
+        $sessionEvents  = $this->buildCurrentEventsArray($campaign);
         $canvasSettings = $this->getCurrentCanvasSettings($campaign);
 
         unset($sessionEvents[$eventId]);
@@ -233,7 +336,7 @@ class CampaignCanvasApiController extends CommonApiController
         );
 
         $redirectEventId = $parameters['redirectEventId'] ?? null;
-        $deletedEvents = [['id' => $eventId, 'redirectEvent' => $redirectEventId]];
+        $deletedEvents   = [['id' => $eventId, 'redirectEvent' => $redirectEventId]];
 
         $this->campaignModel->setEvents($campaign, $sessionEvents, $canvasSettings, $deletedEvents);
         $this->campaignModel->saveEntity($campaign);
@@ -270,18 +373,41 @@ class CampaignCanvasApiController extends CommonApiController
             return $this->handleView($view);
         }
 
-        $sessionEvents = $this->buildCurrentEventsArray($campaign);
+        $sessionEvents  = $this->buildCurrentEventsArray($campaign);
         $canvasSettings = $this->getCurrentCanvasSettings($campaign);
 
         if (!isset($canvasSettings['connections'])) {
             $canvasSettings['connections'] = [];
         }
 
+        // Block duplicate parent: each event can only have one parent
+        $targetIdStr = (string) $targetId;
+        foreach ($canvasSettings['connections'] as $conn) {
+            if ((string) ($conn['targetId'] ?? '') === $targetIdStr) {
+                $existingSource = $conn['sourceId'];
+                $view           = $this->view(
+                    ['error' => "Event {$targetIdStr} already has a parent ({$existingSource}). Remove the existing connection first via DELETE /campaigns/{$id}/connections."],
+                    Response::HTTP_CONFLICT
+                );
+
+                return $this->handleView($view);
+            }
+        }
+
+        // Determine the correct default anchor based on source event type
+        //   - actions: use 'bottom' (output anchor for actions)
+        //   - decisions/conditions: use 'yes' (output anchor for decisions)
+        $sourceEvent         = $this->eventModel->getEntity((int) $sourceId);
+        $defaultSourceAnchor = 'bottom';
+        if ($sourceEvent && in_array($sourceEvent->getEventType(), ['decision', 'condition'], true)) {
+            $defaultSourceAnchor = 'yes';
+        }
+
         $canvasSettings['connections'][] = [
             'sourceId' => (string) $sourceId,
-            'targetId' => (string) $targetId,
+            'targetId' => $targetIdStr,
             'anchors'  => [
-                'source' => $parameters['anchorSource'] ?? 'yes',
+                'source' => $parameters['anchorSource'] ?? $defaultSourceAnchor,
                 'target' => $parameters['anchorTarget'] ?? 'top',
             ],
         ];
@@ -320,7 +446,7 @@ class CampaignCanvasApiController extends CommonApiController
             return $this->handleView($view);
         }
 
-        $sessionEvents = $this->buildCurrentEventsArray($campaign);
+        $sessionEvents  = $this->buildCurrentEventsArray($campaign);
         $canvasSettings = $this->getCurrentCanvasSettings($campaign);
 
         $canvasSettings['connections'] = array_values(
@@ -419,28 +545,28 @@ class CampaignCanvasApiController extends CommonApiController
             }
 
             $events[$event->getId()] = [
-                'id'              => $event->getId(),
-                'name'            => $event->getName(),
-                'description'     => $event->getDescription(),
-                'type'            => $event->getType(),
-                'eventType'       => $event->getEventType(),
-                'order'           => $event->getOrder(),
-                'properties'      => $event->getProperties(),
-                'triggerMode'     => $event->getTriggerMode(),
-                'triggerInterval' => $event->getTriggerInterval(),
-                'triggerIntervalUnit' => $event->getTriggerIntervalUnit(),
-                'triggerDate'     => $event->getTriggerDate()?->format('Y-m-d\TH:i:sP'),
-                'triggerHour'     => $event->getTriggerHour()?->format('H:i'),
-                'triggerRestrictedStartHour' => $event->getTriggerRestrictedStartHour()?->format('H:i'),
-                'triggerRestrictedStopHour' => $event->getTriggerRestrictedStopHour()?->format('H:i'),
+                'id'                          => $event->getId(),
+                'name'                        => $event->getName(),
+                'description'                 => $event->getDescription(),
+                'type'                        => $event->getType(),
+                'eventType'                   => $event->getEventType(),
+                'order'                       => $event->getOrder(),
+                'properties'                  => $event->getProperties(),
+                'triggerMode'                 => $event->getTriggerMode(),
+                'triggerInterval'             => $event->getTriggerInterval(),
+                'triggerIntervalUnit'         => $event->getTriggerIntervalUnit(),
+                'triggerDate'                 => $event->getTriggerDate()?->format('Y-m-d\TH:i:sP'),
+                'triggerHour'                 => $event->getTriggerHour()?->format('H:i'),
+                'triggerRestrictedStartHour'  => $event->getTriggerRestrictedStartHour()?->format('H:i'),
+                'triggerRestrictedStopHour'   => $event->getTriggerRestrictedStopHour()?->format('H:i'),
                 'triggerRestrictedDaysOfWeek' => $event->getTriggerRestrictedDaysOfWeek(),
-                'triggerWindow'   => $event->getTriggerWindow(),
-                'decisionPath'    => $event->getDecisionPath(),
-                'channel'         => $event->getChannel(),
-                'channelId'       => $event->getChannelId(),
-                'tempId'          => null,
-                'children'        => $children,
-                'parent'          => $parentId,
+                'triggerWindow'               => $event->getTriggerWindow(),
+                'decisionPath'                => $event->getDecisionPath(),
+                'channel'                     => $event->getChannel(),
+                'channelId'                   => $event->getChannelId(),
+                'tempId'                      => null,
+                'children'                    => $children,
+                'parent'                      => $parentId,
             ];
         }
 
