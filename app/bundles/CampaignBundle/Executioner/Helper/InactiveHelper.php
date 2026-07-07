@@ -76,7 +76,7 @@ class InactiveHelper
                 continue;
             }
 
-            $earliestContactInactiveDate = $this->getEarliestInactiveDate($negativeChildren, $lastActiveDates[$contactId]);
+            $earliestContactInactiveDate = $this->getEarliestInactiveDate($event, $negativeChildren, $lastActiveDates[$contactId]);
             $this->logger->debug(
                 'CAMPAIGN: Earliest date for inactivity for contact ID# '.$contactId.' is '.
                 $earliestContactInactiveDate->format('Y-m-d H:i:s T').' based on last active date of '.
@@ -123,12 +123,17 @@ class InactiveHelper
     /**
      * @throws \Mautic\CampaignBundle\Executioner\Scheduler\Exception\NotSchedulableException
      */
-    public function getEarliestInactiveDate(ArrayCollection $negativeChildren, \DateTimeInterface $lastActiveDate): ?\DateTimeInterface
+    public function getEarliestInactiveDate(Event $decision, ArrayCollection $negativeChildren, \DateTimeInterface $lastActiveDate): ?\DateTimeInterface
     {
-        $earliestDate = null;
+        // Consider the decision's own trigger_interval (e.g. "wait 3 days for email open")
+        // before considering a contact inactive. This prevents decisions with trigger_mode=interval
+        // from being immediately processed as inactive in the same cron cycle.
+        $decisionInactiveDate = $this->scheduler->getExecutionDateTime($decision, $lastActiveDate);
+
+        $earliestDate = $decisionInactiveDate;
         foreach ($negativeChildren as $event) {
             $executionDate = $this->scheduler->getExecutionDateTime($event, $lastActiveDate);
-            if (!$earliestDate || $executionDate < $earliestDate) {
+            if ($executionDate > $earliestDate) {
                 $earliestDate = $executionDate;
             }
         }
